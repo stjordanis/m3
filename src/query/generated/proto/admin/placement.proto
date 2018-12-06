@@ -2,7 +2,7 @@
 syntax = "proto3";
 package admin;
 
-import "github.com/m3db/m3cluster/generated/proto/placementpb/placement.proto";
+import "github.com/m3db/m3/src/cluster/generated/proto/placementpb/placement.proto";
 
 message PlacementInitRequest {
   repeated placementpb.Instance instances = 1;
@@ -17,4 +17,13 @@ message PlacementGetResponse {
 
 message PlacementAddRequest {
   repeated placementpb.Instance instances = 1;
+  // By default add requests will only succeed if all instances in the placement
+  // are AVAILABLE for all their shards. force overrides that.
+  bool force = 2;
+}
+
+message PlacementReplaceRequest {
+  repeated string leavingInstanceIDs = 1;
+  repeated placementpb.Instance candidates = 2;
+  bool force = 3;
 }

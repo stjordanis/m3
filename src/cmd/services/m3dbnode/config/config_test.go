@@ -26,7 +26,7 @@ import (
 	"testing"
 
 	"github.com/m3db/m3/src/dbnode/environment"
-	xtest "github.com/m3db/m3/src/dbnode/x/test"
+	xtest "github.com/m3db/m3/src/x/test"
 	xconfig "github.com/m3db/m3x/config"
 
 	"github.com/stretchr/testify/assert"
@@ -206,6 +206,13 @@ db:
             size: 8192
             lowWatermark: 0.01
             highWatermark: 0.02
+        writeBatchPool:
+            initialBatchSize: 128
+            maxBatchSize: 100000
+            pool:
+              size: 8192
+              lowWatermark: 0.01
+              highWatermark: 0.02
         identifierPool:
             size: 9437184
             lowWatermark: 0.01
@@ -327,6 +334,7 @@ db:
     resolver: config
     value: host1
     envVarName: null
+    file: null
   client:
     config:
       service: null
@@ -367,7 +375,7 @@ db:
     - noop-all
     fs:
       numProcessorsPerCPU: 0.125
-    peers: null
+    commitlog: null
     cacheSeriesMetadata: null
   blockRetrieve: null
   cache:
@@ -389,6 +397,7 @@ db:
     queue:
       calculationType: fixed
       size: 2097152
+    queueChannel: null
     blockSize: 10m0s
   repair:
     enabled: false
@@ -522,6 +531,13 @@ db:
       size: 8192
       lowWatermark: 0.01
       highWatermark: 0.02
+    writeBatchPool:
+      initialBatchSize: 128
+      maxBatchSize: 100000
+      pool:
+        size: 8192
+        lowWatermark: 0.01
+        highWatermark: 0.02
   config:
     service:
       zone: embedded
@@ -534,11 +550,7 @@ db:
         - 1.1.1.1:2379
         - 1.1.1.2:2379
         - 1.1.1.3:2379
-        keepAlive:
-          enabled: false
-          period: 0s
-          jitter: 0s
-          timeout: 0s
+        keepAlive: null
         tls: null
       m3sd:
         initTimeout: null

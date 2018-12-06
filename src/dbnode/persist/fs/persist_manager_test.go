@@ -33,6 +33,7 @@ import (
 	"github.com/m3db/m3/src/m3ninx/index/segment"
 	m3ninxfs "github.com/m3db/m3/src/m3ninx/index/segment/fst"
 	m3ninxpersist "github.com/m3db/m3/src/m3ninx/persist"
+	m3test "github.com/m3db/m3/src/x/test"
 	"github.com/m3db/m3x/checked"
 	"github.com/m3db/m3x/ident"
 	xtest "github.com/m3db/m3x/test"
@@ -49,13 +50,14 @@ func TestPersistenceManagerPrepareDataFileExistsNoDelete(t *testing.T) {
 	pm, _, _ := testDataPersistManager(t, ctrl)
 	defer os.RemoveAll(pm.filePathPrefix)
 
-	shard := uint32(0)
-	blockStart := time.Unix(1000, 0)
-	shardDir := createDataShardDir(t, pm.filePathPrefix, testNs1ID, shard)
-	checkpointFilePath := filesetPathFromTime(shardDir, blockStart, checkpointFileSuffix)
-	f, err := os.Create(checkpointFilePath)
-	require.NoError(t, err)
-	f.Close()
+	var (
+		shard              = uint32(0)
+		blockStart         = time.Unix(1000, 0)
+		shardDir           = createDataShardDir(t, pm.filePathPrefix, testNs1ID, shard)
+		checkpointFilePath = filesetPathFromTime(shardDir, blockStart, checkpointFileSuffix)
+		checkpointFileBuf  = make([]byte, CheckpointFileSizeBytes)
+	)
+	createFile(t, checkpointFilePath, checkpointFileBuf)
 
 	flush, err := pm.StartDataPersist()
 	require.NoError(t, err)
@@ -82,8 +84,10 @@ func TestPersistenceManagerPrepareDataFileExistsWithDelete(t *testing.T) {
 	pm, writer, _ := testDataPersistManager(t, ctrl)
 	defer os.RemoveAll(pm.filePathPrefix)
 
-	shard := uint32(0)
-	blockStart := time.Unix(1000, 0)
+	var (
+		shard      = uint32(0)
+		blockStart = time.Unix(1000, 0)
+	)
 
 	writerOpts := xtest.CmpMatcher(DataWriterOpenOptions{
 		Identifier: FileSetFileIdentifier{
@@ -92,14 +96,15 @@ func TestPersistenceManagerPrepareDataFileExistsWithDelete(t *testing.T) {
 			BlockStart: blockStart,
 		},
 		BlockSize: testBlockSize,
-	})
+	}, m3test.IdentTransformer)
 	writer.EXPECT().Open(writerOpts).Return(nil)
 
-	shardDir := createDataShardDir(t, pm.filePathPrefix, testNs1ID, shard)
-	checkpointFilePath := filesetPathFromTime(shardDir, blockStart, checkpointFileSuffix)
-	f, err := os.Create(checkpointFilePath)
-	require.NoError(t, err)
-	f.Close()
+	var (
+		shardDir           = createDataShardDir(t, pm.filePathPrefix, testNs1ID, shard)
+		checkpointFilePath = filesetPathFromTime(shardDir, blockStart, checkpointFileSuffix)
+		checkpointFileBuf  = make([]byte, CheckpointFileSizeBytes)
+	)
+	createFile(t, checkpointFilePath, checkpointFileBuf)
 
 	flush, err := pm.StartDataPersist()
 	require.NoError(t, err)
@@ -142,7 +147,7 @@ func TestPersistenceManagerPrepareOpenError(t *testing.T) {
 			BlockStart: blockStart,
 		},
 		BlockSize: testBlockSize,
-	})
+	}, m3test.IdentTransformer)
 	writer.EXPECT().Open(writerOpts).Return(expectedErr)
 
 	flush, err := pm.StartDataPersist()
@@ -179,7 +184,7 @@ func TestPersistenceManagerPrepareSuccess(t *testing.T) {
 			BlockStart: blockStart,
 		},
 		BlockSize: testBlockSize,
-	})
+	}, m3test.IdentTransformer)
 	writer.EXPECT().Open(writerOpts).Return(nil)
 
 	var (
@@ -277,8 +282,8 @@ func TestPersistenceManagerPrepareIndexFileExists(t *testing.T) {
 				Namespace:          testNs1ID,
 				VolumeIndex:        1,
 			},
-		},
-	)).Return(nil)
+		}, m3test.IdentTransformer),
+	).Return(nil)
 	prepared, err := flush.PrepareIndex(prepareOpts)
 	require.NoError(t, err)
 	require.NotNil(t, prepared.Persist)
@@ -303,7 +308,7 @@ func TestPersistenceManagerPrepareIndexOpenError(t *testing.T) {
 			BlockStart:         blockStart,
 		},
 		BlockSize: testBlockSize,
-	})
+	}, m3test.IdentTransformer)
 	writer.EXPECT().Open(writerOpts).Return(expectedErr)
 
 	flush, err := pm.StartIndexPersist()
@@ -340,7 +345,7 @@ func TestPersistenceManagerPrepareIndexSuccess(t *testing.T) {
 		},
 		BlockSize: testBlockSize,
 	}
-	writer.EXPECT().Open(xtest.CmpMatcher(writerOpts)).Return(nil)
+	writer.EXPECT().Open(xtest.CmpMatcher(writerOpts, m3test.IdentTransformer)).Return(nil)
 
 	flush, err := pm.StartIndexPersist()
 	require.NoError(t, err)
@@ -369,7 +374,7 @@ func TestPersistenceManagerPrepareIndexSuccess(t *testing.T) {
 
 	reader.EXPECT().Open(xtest.CmpMatcher(IndexReaderOpenOptions{
 		Identifier: writerOpts.Identifier,
-	})).Return(IndexReaderOpenResult{}, nil)
+	}, m3test.IdentTransformer)).Return(IndexReaderOpenResult{}, nil)
 
 	file := NewMockIndexSegmentFile(ctrl)
 	gomock.InOrder(
@@ -408,7 +413,7 @@ func TestPersistenceManagerNoRateLimit(t *testing.T) {
 			BlockStart: blockStart,
 		},
 		BlockSize: testBlockSize,
-	})
+	}, m3test.IdentTransformer)
 	writer.EXPECT().Open(writerOpts).Return(nil)
 
 	var (
@@ -487,7 +492,7 @@ func TestPersistenceManagerWithRateLimit(t *testing.T) {
 			BlockStart: blockStart,
 		},
 		BlockSize: testBlockSize,
-	})
+	}, m3test.IdentTransformer)
 	writer.EXPECT().Open(writerOpts).Return(nil).Times(iter)
 	writer.EXPECT().WriteAll(id, ident.Tags{}, pm.dataPM.segmentHolder, checksum).Return(nil).AnyTimes()
 	writer.EXPECT().Close().Times(iter)
@@ -577,7 +582,7 @@ func TestPersistenceManagerNamespaceSwitch(t *testing.T) {
 			BlockStart: blockStart,
 		},
 		BlockSize: testBlockSize,
-	})
+	}, m3test.IdentTransformer)
 	writer.EXPECT().Open(writerOpts).Return(nil)
 	prepareOpts := persist.DataPrepareOptions{
 		NamespaceMetadata: testNs1Metadata(t),
@@ -596,7 +601,7 @@ func TestPersistenceManagerNamespaceSwitch(t *testing.T) {
 			BlockStart: blockStart,
 		},
 		BlockSize: testBlockSize,
-	})
+	}, m3test.IdentTransformer)
 	writer.EXPECT().Open(writerOpts).Return(nil)
 	prepareOpts = persist.DataPrepareOptions{
 		NamespaceMetadata: testNs2Metadata(t),

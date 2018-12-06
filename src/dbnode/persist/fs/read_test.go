@@ -33,8 +33,8 @@ import (
 	"github.com/m3db/m3/src/dbnode/digest"
 	"github.com/m3db/m3/src/dbnode/persist/fs/msgpack"
 	"github.com/m3db/m3/src/dbnode/persist/schema"
-	"github.com/m3db/m3/src/dbnode/serialize"
 	"github.com/m3db/m3/src/x/mmap"
+	"github.com/m3db/m3/src/x/serialize"
 	"github.com/m3db/m3x/checked"
 	"github.com/m3db/m3x/ident"
 	"github.com/m3db/m3x/pool"
@@ -269,9 +269,13 @@ func TestReadNoCheckpointFile(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NoError(t, w.Close())
 
-	shardDir := ShardDataDirPath(filePathPrefix, testNs1ID, shard)
-	checkpointFile := filesetPathFromTime(shardDir, testWriterStart, checkpointFileSuffix)
-	require.True(t, mustFileExists(t, checkpointFile))
+	var (
+		shardDir       = ShardDataDirPath(filePathPrefix, testNs1ID, shard)
+		checkpointFile = filesetPathFromTime(shardDir, testWriterStart, checkpointFileSuffix)
+	)
+	exists, err := CompleteCheckpointFileExists(checkpointFile)
+	require.NoError(t, err)
+	require.True(t, exists)
 	os.Remove(checkpointFile)
 
 	r := newTestReader(t, filePathPrefix)

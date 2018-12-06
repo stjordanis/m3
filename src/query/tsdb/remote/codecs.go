@@ -48,19 +48,19 @@ func toTime(t int64) time.Time {
 }
 
 func encodeTags(tags models.Tags) []*rpc.Tag {
-	encodedTags := make([]*rpc.Tag, 0, len(tags))
-	for _, t := range tags {
+	encodedTags := make([]*rpc.Tag, 0, tags.Len())
+	for _, t := range tags.Tags {
 		encodedTags = append(encodedTags, &rpc.Tag{
-			Name:  []byte(t.Name),
-			Value: []byte(t.Value),
+			Name:  t.Name,
+			Value: t.Value,
 		})
 	}
 
 	return encodedTags
 }
 
-// EncodeFetchResult encodes fetch result to rpc response
-func EncodeFetchResult(results *storage.FetchResult) *rpc.FetchResponse {
+// encodeFetchResult  encodes fetch result to rpc response
+func encodeFetchResult(results *storage.FetchResult) *rpc.FetchResponse {
 	series := make([]*rpc.Series, len(results.SeriesList))
 	for i, result := range results.SeriesList {
 		vLen := result.Len()
@@ -91,15 +91,16 @@ func EncodeFetchResult(results *storage.FetchResult) *rpc.FetchResponse {
 	}
 }
 
-// DecodeDecompressedFetchResult decodes fetch results from a GRPC-compatible type.
-func DecodeDecompressedFetchResult(
+// decodeDecompressedFetchResult decodes fetch results from a GRPC-compatible type.
+func decodeDecompressedFetchResult(
 	name string,
+	tagOptions models.TagOptions,
 	rpcSeries []*rpc.DecompressedSeries,
 ) ([]*ts.Series, error) {
 	tsSeries := make([]*ts.Series, len(rpcSeries))
 	var err error
 	for i, series := range rpcSeries {
-		tsSeries[i], err = decodeTs(name, series)
+		tsSeries[i], err = decodeTs(name, tagOptions, series)
 		if err != nil {
 			return nil, err
 		}
@@ -108,10 +109,13 @@ func DecodeDecompressedFetchResult(
 	return tsSeries, nil
 }
 
-func decodeTags(tags []*rpc.Tag) models.Tags {
-	modelTags := make(models.Tags, len(tags))
-	for i, t := range tags {
-		modelTags[i] = models.Tag{Name: string(t.GetName()), Value: string(t.GetValue())}
+func decodeTags(
+	tags []*rpc.Tag,
+	tagOptions models.TagOptions,
+) models.Tags {
+	modelTags := models.NewTags(len(tags), tagOptions)
+	for _, t := range tags {
+		modelTags = modelTags.AddTag(models.Tag{Name: t.GetName(), Value: t.GetValue()})
 	}
 
 	return modelTags
@@ -119,10 +123,11 @@ func decodeTags(tags []*rpc.Tag) models.Tags {
 
 func decodeTs(
 	name string,
+	tagOptions models.TagOptions,
 	r *rpc.DecompressedSeries,
 ) (*ts.Series, error) {
 	values := decodeRawTs(r)
-	tags := decodeTags(r.GetTags())
+	tags := decodeTags(r.GetTags(), tagOptions)
 	series := ts.NewSeries(name, values, tags)
 	return series, nil
 }
@@ -139,8 +144,8 @@ func decodeRawTs(r *rpc.DecompressedSeries) ts.Datapoints {
 	return datapoints
 }
 
-// EncodeFetchRequest encodes fetch request into rpc FetchRequest
-func EncodeFetchRequest(
+// encodeFetchRequest encodes fetch request into rpc FetchRequest
+func encodeFetchRequest(
 	query *storage.FetchQuery,
 ) (*rpc.FetchRequest, error) {
 	matchers, err := encodeTagMatchers(query.TagMatchers)
@@ -166,8 +171,8 @@ func encodeTagMatchers(modelMatchers models.Matchers) (*rpc.TagMatchers, error) 
 		}
 
 		matchers[i] = &rpc.TagMatcher{
-			Name:  []byte(matcher.Name),
-			Value: []byte(matcher.Value),
+			Name:  matcher.Name,
+			Value: matcher.Value,
 			Type:  t,
 		}
 	}
@@ -192,8 +197,8 @@ func encodeMatcherTypeToProto(t models.MatchType) (rpc.MatcherType, error) {
 	}
 }
 
-// EncodeMetadata creates a context that propagates request metadata as well as requestID
-func EncodeMetadata(ctx context.Context, requestID string) context.Context {
+// encodeMetadata creates a context that propagates request metadata as well as requestID
+func encodeMetadata(ctx context.Context, requestID string) context.Context {
 	if ctx == nil {
 		return ctx
 	}
@@ -219,8 +224,8 @@ func convertHeaderToMetaWithID(headers http.Header, requestID string) metadata.M
 	return meta
 }
 
-// RetrieveMetadata creates a context with propagated request metadata as well as requestID
-func RetrieveMetadata(streamCtx context.Context) context.Context {
+// creates a context with propagated request metadata as well as requestID
+func retrieveMetadata(streamCtx context.Context) context.Context {
 	md, ok := metadata.FromIncomingContext(streamCtx)
 	id := "unknown"
 	if ok {
@@ -233,8 +238,7 @@ func RetrieveMetadata(streamCtx context.Context) context.Context {
 	return logging.NewContextWithID(streamCtx, id)
 }
 
-// DecodeFetchRequest decodes rpc fetch request to read query and read options
-func DecodeFetchRequest(
+func decodeFetchRequest(
 	req *rpc.FetchRequest,
 ) (*storage.FetchQuery, error) {
 	tags, err := decodeTagMatchers(req.GetTagMatchers())
@@ -251,10 +255,10 @@ func DecodeFetchRequest(
 
 func decodeTagMatchers(rpcMatchers *rpc.TagMatchers) (models.Matchers, error) {
 	tagMatchers := rpcMatchers.GetTagMatchers()
-	matchers := make([]*models.Matcher, len(tagMatchers))
+	matchers := make([]models.Matcher, len(tagMatchers))
 	for i, matcher := range tagMatchers {
 		matchType, name, value := models.MatchType(matcher.GetType()), matcher.GetName(), matcher.GetValue()
-		mMatcher, err := models.NewMatcher(matchType, string(name), string(value))
+		mMatcher, err := models.NewMatcher(matchType, name, value)
 		if err != nil {
 			return matchers, err
 		}

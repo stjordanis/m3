@@ -27,7 +27,10 @@ import (
 	"github.com/m3db/m3/src/query/functions/aggregation"
 	"github.com/m3db/m3/src/query/functions/binary"
 	"github.com/m3db/m3/src/query/functions/linear"
+	"github.com/m3db/m3/src/query/functions/scalar"
+	"github.com/m3db/m3/src/query/functions/tag"
 	"github.com/m3db/m3/src/query/functions/temporal"
+	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/parser"
 
 	"github.com/stretchr/testify/assert"
@@ -36,7 +39,7 @@ import (
 
 func TestDAGWithCountOp(t *testing.T) {
 	q := "count(http_requests_total{method=\"GET\"} offset 5m) by (service)"
-	p, err := Parse(q)
+	p, err := Parse(q, models.NewTagOptions())
 	require.NoError(t, err)
 	transforms, edges, err := p.DAG()
 	require.NoError(t, err)
@@ -52,13 +55,13 @@ func TestDAGWithCountOp(t *testing.T) {
 
 func TestDAGWithEmptyExpression(t *testing.T) {
 	q := ""
-	_, err := Parse(q)
+	_, err := Parse(q, models.NewTagOptions())
 	require.Error(t, err)
 }
 
 func TestDAGWithFakeOp(t *testing.T) {
 	q := "fake(http_requests_total{method=\"GET\"})"
-	_, err := Parse(q)
+	_, err := Parse(q, models.NewTagOptions())
 	require.Error(t, err)
 }
 
@@ -84,7 +87,7 @@ func TestAggregateParses(t *testing.T) {
 	for _, tt := range aggregateParseTests {
 		t.Run(tt.q, func(t *testing.T) {
 			q := tt.q
-			p, err := Parse(q)
+			p, err := Parse(q, models.NewTagOptions())
 			require.NoError(t, err)
 			transforms, edges, err := p.DAG()
 			require.NoError(t, err)
@@ -132,7 +135,7 @@ func TestLinearParses(t *testing.T) {
 	for _, tt := range linearParseTests {
 		t.Run(tt.q, func(t *testing.T) {
 			q := tt.q
-			p, err := Parse(q)
+			p, err := Parse(q, models.NewTagOptions())
 			require.NoError(t, err)
 			transforms, edges, err := p.DAG()
 			require.NoError(t, err)
@@ -148,6 +151,42 @@ func TestLinearParses(t *testing.T) {
 	}
 }
 
+var sortTests = []struct {
+	q            string
+	expectedType string
+}{
+	{"sort(up)", linear.SortType},
+	{"sort_desc(up)", linear.SortDescType},
+}
+
+func TestSort(t *testing.T) {
+	for _, tt := range sortTests {
+		t.Run(tt.q, func(t *testing.T) {
+			q := tt.q
+			p, err := Parse(q, models.NewTagOptions())
+			require.NoError(t, err)
+			transforms, edges, err := p.DAG()
+			require.NoError(t, err)
+			assert.Len(t, transforms, 1)
+			assert.Equal(t, transforms[0].Op.OpType(), functions.FetchType)
+			assert.Equal(t, transforms[0].ID, parser.NodeID("0"))
+			assert.Len(t, edges, 0)
+		})
+	}
+}
+
+func TestTimeTypeParse(t *testing.T) {
+	q := "time()"
+	p, err := Parse(q, models.NewTagOptions())
+	require.NoError(t, err)
+	transforms, edges, err := p.DAG()
+	require.NoError(t, err)
+	assert.Len(t, transforms, 1)
+	assert.Equal(t, transforms[0].Op.OpType(), scalar.TimeType)
+	assert.Equal(t, transforms[0].ID, parser.NodeID("0"))
+	assert.Len(t, edges, 0)
+}
+
 var binaryParseTests = []struct {
 	q                string
 	LHSType, RHSType string
@@ -155,19 +194,19 @@ var binaryParseTests = []struct {
 }{
 	// Arithmetic
 	{"up / up", functions.FetchType, functions.FetchType, binary.DivType},
-	{"up ^ 10", functions.FetchType, functions.ScalarType, binary.ExpType},
-	{"10 - up", functions.ScalarType, functions.FetchType, binary.MinusType},
-	{"10 + 10", functions.ScalarType, functions.ScalarType, binary.PlusType},
+	{"up ^ 10", functions.FetchType, scalar.ScalarType, binary.ExpType},
+	{"10 - up", scalar.ScalarType, functions.FetchType, binary.MinusType},
+	{"10 + 10", scalar.ScalarType, scalar.ScalarType, binary.PlusType},
 	{"up % up", functions.FetchType, functions.FetchType, binary.ModType},
-	{"up * 10", functions.FetchType, functions.ScalarType, binary.MultiplyType},
+	{"up * 10", functions.FetchType, scalar.ScalarType, binary.MultiplyType},
 
 	// Equality
 	{"up == up", functions.FetchType, functions.FetchType, binary.EqType},
-	{"up != 10", functions.FetchType, functions.ScalarType, binary.NotEqType},
+	{"up != 10", functions.FetchType, scalar.ScalarType, binary.NotEqType},
 	{"up > up", functions.FetchType, functions.FetchType, binary.GreaterType},
-	{"10 < up", functions.ScalarType, functions.FetchType, binary.LesserType},
-	{"up >= 10", functions.FetchType, functions.ScalarType, binary.GreaterEqType},
-	{"up <= 10", functions.FetchType, functions.ScalarType, binary.LesserEqType},
+	{"10 < up", scalar.ScalarType, functions.FetchType, binary.LesserType},
+	{"up >= 10", functions.FetchType, scalar.ScalarType, binary.GreaterEqType},
+	{"up <= 10", functions.FetchType, scalar.ScalarType, binary.LesserEqType},
 
 	// Logical
 	{"up and up", functions.FetchType, functions.FetchType, binary.AndType},
@@ -178,7 +217,8 @@ var binaryParseTests = []struct {
 func TestBinaryParses(t *testing.T) {
 	for _, tt := range binaryParseTests {
 		t.Run(tt.q, func(t *testing.T) {
-			p, err := Parse(tt.q)
+			p, err := Parse(tt.q, models.NewTagOptions())
+
 			require.NoError(t, err)
 			transforms, edges, err := p.DAG()
 			require.NoError(t, err)
@@ -199,19 +239,19 @@ func TestBinaryParses(t *testing.T) {
 }
 
 func TestParenPrecedenceParses(t *testing.T) {
-	p, err := Parse("(5^(up-6))")
+	p, err := Parse("(5^(up-6))", models.NewTagOptions())
 	require.NoError(t, err)
 	transforms, edges, err := p.DAG()
 	require.NoError(t, err)
 	require.Len(t, transforms, 5)
 	// 5
-	assert.Equal(t, transforms[0].Op.OpType(), functions.ScalarType)
+	assert.Equal(t, transforms[0].Op.OpType(), scalar.ScalarType)
 	assert.Equal(t, transforms[0].ID, parser.NodeID("0"))
 	// up
 	assert.Equal(t, transforms[1].Op.OpType(), functions.FetchType)
 	assert.Equal(t, transforms[1].ID, parser.NodeID("1"))
 	// 6
-	assert.Equal(t, transforms[2].Op.OpType(), functions.ScalarType)
+	assert.Equal(t, transforms[2].Op.OpType(), scalar.ScalarType)
 	assert.Equal(t, transforms[2].ID, parser.NodeID("2"))
 	// -
 	assert.Equal(t, transforms[3].Op.OpType(), binary.MinusType)
@@ -248,15 +288,49 @@ var temporalParseTests = []struct {
 	{"stdvar_over_time(up[5m])", temporal.StdVarType},
 	{"irate(up[5m])", temporal.IRateType},
 	{"idelta(up[5m])", temporal.IDeltaType},
+	{"rate(up[5m])", temporal.RateType},
+	{"delta(up[5m])", temporal.DeltaType},
+	{"increase(up[5m])", temporal.IncreaseType},
 	{"resets(up[5m])", temporal.ResetsType},
 	{"changes(up[5m])", temporal.ChangesType},
+	{"holt_winters(up[5m], 0.2, 0.3)", temporal.HoltWintersType},
+	{"predict_linear(up[5m], 100)", temporal.PredictLinearType},
+	{"deriv(up[5m])", temporal.DerivType},
 }
 
 func TestTemporalParses(t *testing.T) {
 	for _, tt := range temporalParseTests {
 		t.Run(tt.q, func(t *testing.T) {
 			q := tt.q
-			p, err := Parse(q)
+			p, err := Parse(q, models.NewTagOptions())
+			require.NoError(t, err)
+			transforms, edges, err := p.DAG()
+			require.NoError(t, err)
+			assert.Len(t, transforms, 2)
+			assert.Equal(t, transforms[0].Op.OpType(), functions.FetchType)
+			assert.Equal(t, transforms[0].ID, parser.NodeID("0"))
+			assert.Equal(t, transforms[1].Op.OpType(), tt.expectedType)
+			assert.Equal(t, transforms[1].ID, parser.NodeID("1"))
+			assert.Len(t, edges, 1)
+			assert.Equal(t, edges[0].ParentID, parser.NodeID("0"))
+			assert.Equal(t, edges[0].ChildID, parser.NodeID("1"))
+		})
+	}
+}
+
+var tagParseTests = []struct {
+	q            string
+	expectedType string
+}{
+	{`label_join(up, "foo", ",", "s1","s2","s4")`, tag.TagJoinType},
+	{`label_replace(up, "foo", "$1", "tagname","(.*):.*")`, tag.TagReplaceType},
+}
+
+func TestTagParses(t *testing.T) {
+	for _, tt := range tagParseTests {
+		t.Run(tt.q, func(t *testing.T) {
+			q := tt.q
+			p, err := Parse(q, models.NewTagOptions())
 			require.NoError(t, err)
 			transforms, edges, err := p.DAG()
 			require.NoError(t, err)
@@ -274,6 +348,6 @@ func TestTemporalParses(t *testing.T) {
 
 func TestFailedTemporalParse(t *testing.T) {
 	q := "unknown_over_time(http_requests_total[5m])"
-	_, err := Parse(q)
+	_, err := Parse(q, models.NewTagOptions())
 	require.Error(t, err)
 }

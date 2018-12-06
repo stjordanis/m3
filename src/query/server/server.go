@@ -30,14 +30,18 @@ import (
 	"syscall"
 	"time"
 
+	clusterclient "github.com/m3db/m3/src/cluster/client"
+	etcdclient "github.com/m3db/m3/src/cluster/client/etcd"
 	"github.com/m3db/m3/src/cmd/services/m3coordinator/downsample"
 	dbconfig "github.com/m3db/m3/src/cmd/services/m3dbnode/config"
 	"github.com/m3db/m3/src/cmd/services/m3query/config"
 	"github.com/m3db/m3/src/dbnode/client"
-	"github.com/m3db/m3/src/dbnode/serialize"
+	"github.com/m3db/m3/src/metrics/aggregation"
+	"github.com/m3db/m3/src/metrics/policy"
 	"github.com/m3db/m3/src/query/api/v1/httpd"
 	m3dbcluster "github.com/m3db/m3/src/query/cluster/m3db"
 	"github.com/m3db/m3/src/query/executor"
+	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/policy/filter"
 	"github.com/m3db/m3/src/query/pools"
 	"github.com/m3db/m3/src/query/storage"
@@ -47,10 +51,7 @@ import (
 	"github.com/m3db/m3/src/query/stores/m3db"
 	tsdbRemote "github.com/m3db/m3/src/query/tsdb/remote"
 	"github.com/m3db/m3/src/query/util/logging"
-	clusterclient "github.com/m3db/m3cluster/client"
-	etcdclient "github.com/m3db/m3cluster/client/etcd"
-	"github.com/m3db/m3metrics/aggregation"
-	"github.com/m3db/m3metrics/policy"
+	"github.com/m3db/m3/src/x/serialize"
 	"github.com/m3db/m3x/clock"
 	xconfig "github.com/m3db/m3x/config"
 	"github.com/m3db/m3x/ident"
@@ -60,6 +61,7 @@ import (
 	xtime "github.com/m3db/m3x/time"
 
 	"github.com/pkg/errors"
+	"github.com/uber-go/tally"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 )
@@ -120,6 +122,9 @@ func Run(runOpts RunOptions) {
 	if err != nil {
 		logger.Fatal("could not connect to metrics", zap.Any("error", err))
 	}
+	instrumentOptions := instrument.NewOptions().
+		SetMetricsScope(scope).
+		SetZapLogger(logger)
 
 	// Close metrics scope
 	defer func() {
@@ -136,16 +141,35 @@ func Run(runOpts RunOptions) {
 		enabled        bool
 	)
 
-	workerPool, writeWorkerPool, instrumentOptions, err := pools.BuildWorkerPools(cfg, logger, scope)
+	readWorkerPool, writeWorkerPool, err := pools.BuildWorkerPools(
+		instrumentOptions,
+		cfg.ReadWorkerPool,
+		cfg.WriteWorkerPool,
+		scope,
+	)
 	if err != nil {
-		logger.Fatal("could not create worker pools", zap.Any("error", err))
+		logger.Fatal("could not create worker pools", zap.Error(err))
 	}
 
+	tagOptions, err := config.TagOptionsFromConfig(cfg.TagOptions)
+	if err != nil {
+		logger.Fatal("could not create tag options", zap.Error(err))
+	}
+
+	var (
+		m3dbClusters    m3.Clusters
+		m3dbPoolWrapper *pools.PoolWrapper
+	)
 	// For grpc backend, we need to setup only the grpc client and a storage accompanying that client.
 	// For m3db backend, we need to make connections to the m3db cluster which generates a session and use the storage with the session.
 	if cfg.Backend == config.GRPCStorageType {
 		poolWrapper := pools.NewPoolsWrapper(pools.BuildIteratorPools())
-		backendStorage, enabled, err = remoteClient(cfg, poolWrapper, workerPool)
+		backendStorage, enabled, err = remoteClient(
+			cfg,
+			tagOptions,
+			poolWrapper,
+			readWorkerPool,
+		)
 		if err != nil {
 			logger.Fatal("unable to setup grpc backend", zap.Error(err))
 		}
@@ -155,14 +179,22 @@ func Run(runOpts RunOptions) {
 
 		logger.Info("setup grpc backend")
 	} else {
+		m3dbClusters, m3dbPoolWrapper, err = initClusters(cfg, runOpts.DBClient, logger)
+		if err != nil {
+			logger.Fatal("unable to init clusters", zap.Error(err))
+		}
+
 		var cleanup cleanupFn
 		backendStorage, clusterClient, downsampler, cleanup, err = newM3DBStorage(
 			runOpts,
 			cfg,
+			tagOptions,
 			logger,
-			workerPool,
-			writeWorkerPool,
+			m3dbClusters,
+			m3dbPoolWrapper,
 			instrumentOptions,
+			readWorkerPool,
+			writeWorkerPool,
 		)
 		if err != nil {
 			logger.Fatal("unable to setup m3db backend", zap.Error(err))
@@ -170,10 +202,10 @@ func Run(runOpts RunOptions) {
 		defer cleanup()
 	}
 
-	engine := executor.NewEngine(backendStorage)
+	engine := executor.NewEngine(backendStorage, scope.SubScope("engine"))
 
-	handler, err := httpd.NewHandler(backendStorage, downsampler, engine,
-		clusterClient, cfg, runOpts.DBConfig, scope)
+	handler, err := httpd.NewHandler(backendStorage, tagOptions, downsampler, engine,
+		m3dbClusters, clusterClient, cfg, runOpts.DBConfig, scope)
 	if err != nil {
 		logger.Fatal("unable to set up handlers", zap.Error(err))
 	}
@@ -187,22 +219,47 @@ func Run(runOpts RunOptions) {
 		logger.Fatal("unable to get listen address", zap.Error(err))
 	}
 
-	srv := &http.Server{Addr: listenAddress, Handler: handler.Router}
+	srv := &http.Server{Addr: listenAddress, Handler: handler.Router()}
 	defer func() {
 		logger.Info("closing server")
 		if err := srv.Shutdown(ctx); err != nil {
 			logger.Error("error closing server", zap.Error(err))
 		}
-
 	}()
 
 	go func() {
 		logger.Info("starting server", zap.String("address", listenAddress))
-		if err := srv.ListenAndServe(); err != nil {
-			logger.Error("server error while listening",
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Fatal("server error while listening",
 				zap.String("address", listenAddress), zap.Error(err))
 		}
 	}()
+
+	if cfg.Ingest != nil {
+		logger.Info("starting m3msg server ")
+		ingester, err := cfg.Ingest.Ingester.NewIngester(backendStorage, instrumentOptions)
+		if err != nil {
+			logger.Fatal("unable to create ingester", zap.Error(err))
+		}
+
+		server, err := cfg.Ingest.M3Msg.NewServer(
+			ingester.Ingest,
+			instrumentOptions.SetMetricsScope(scope.SubScope("m3msg")),
+		)
+
+		if err != nil {
+			logger.Fatal("unable to create m3msg server", zap.Error(err))
+		}
+
+		if err := server.ListenAndServe(); err != nil {
+			logger.Fatal("unable to listen on ingest server", zap.Error(err))
+		}
+
+		logger.Info("started m3msg server ")
+		defer server.Close()
+	} else {
+		logger.Info("no m3msg server configured")
+	}
 
 	var interruptCh <-chan error = make(chan error)
 	if runOpts.InterruptCh != nil {
@@ -224,28 +281,34 @@ func Run(runOpts RunOptions) {
 		}
 	}
 
-	logger.Info(fmt.Sprintf("interrupt: %s", interruptErr))
+	logger.Info("interrupt", zap.String("cause", interruptErr.Error()))
 }
 
 // make connections to the m3db cluster(s) and generate sessions for those clusters along with the storage
 func newM3DBStorage(
 	runOpts RunOptions,
 	cfg config.Configuration,
+	tagOptions models.TagOptions,
 	logger *zap.Logger,
-	workerPool pool.ObjectPool,
-	writeWorkerPool xsync.PooledWorkerPool,
+	clusters m3.Clusters,
+	poolWrapper *pools.PoolWrapper,
 	instrumentOptions instrument.Options,
+	readWorkerPool xsync.PooledWorkerPool,
+	writeWorkerPool xsync.PooledWorkerPool,
 ) (storage.Storage, clusterclient.Client, downsample.Downsampler, cleanupFn, error) {
-	var clusterClientCh <-chan clusterclient.Client
-	if runOpts.ClusterClient != nil {
-		clusterClientCh = runOpts.ClusterClient
-	}
-
 	var (
-		clusterManagementClient clusterclient.Client
-		err                     error
+		clusterClient       clusterclient.Client
+		clusterClientWaitCh <-chan struct{}
 	)
-	if clusterClientCh == nil {
+	if clusterClientCh := runOpts.ClusterClient; clusterClientCh != nil {
+		// Only use a cluster client if we are going to receive one, that
+		// way passing nil to httpd NewHandler disables the endpoints entirely
+		clusterClientDoneCh := make(chan struct{}, 1)
+		clusterClientWaitCh = clusterClientDoneCh
+		clusterClient = m3dbcluster.NewAsyncClient(func() (clusterclient.Client, error) {
+			return <-clusterClientCh, nil
+		}, clusterClientDoneCh)
+	} else {
 		var etcdCfg *etcdclient.Configuration
 		switch {
 		case cfg.ClusterManagement != nil:
@@ -258,35 +321,28 @@ func newM3DBStorage(
 
 		if etcdCfg != nil {
 			// We resolved an etcd configuration for cluster management endpoints
-			clusterSvcClientOpts := etcdCfg.NewOptions()
-			clusterManagementClient, err = etcdclient.NewConfigServiceClient(clusterSvcClientOpts)
+			var (
+				clusterSvcClientOpts = etcdCfg.NewOptions()
+				err                  error
+			)
+			clusterClient, err = etcdclient.NewConfigServiceClient(clusterSvcClientOpts)
 			if err != nil {
 				return nil, nil, nil, nil, errors.Wrap(err, "unable to create cluster management etcd client")
 			}
-
-			clusterClientSendableCh := make(chan clusterclient.Client, 1)
-			clusterClientSendableCh <- clusterManagementClient
-			clusterClientCh = clusterClientSendableCh
 		}
 	}
 
-	clusters, poolWrapper, err := initClusters(cfg, runOpts.DBClient, logger)
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-
-	fanoutStorage, storageCleanup, err := newStorages(logger, clusters, cfg, poolWrapper, workerPool, writeWorkerPool)
+	fanoutStorage, storageCleanup, err := newStorages(
+		logger,
+		clusters,
+		cfg,
+		tagOptions,
+		poolWrapper,
+		readWorkerPool,
+		writeWorkerPool,
+	)
 	if err != nil {
 		return nil, nil, nil, nil, errors.Wrap(err, "unable to set up storages")
-	}
-
-	var clusterClient clusterclient.Client
-	if clusterClientCh != nil {
-		// Only use a cluster client if we are going to receive one, that
-		// way passing nil to httpd NewHandler disables the endpoints entirely
-		clusterClient = m3dbcluster.NewAsyncClient(func() (clusterclient.Client, error) {
-			return <-clusterClientCh, nil
-		}, nil)
 	}
 
 	var (
@@ -300,10 +356,26 @@ func newM3DBStorage(
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
-		downsampler, err = newDownsampler(clusterManagementClient,
-			fanoutStorage, autoMappingRules, instrumentOptions)
-		if err != nil {
-			return nil, nil, nil, nil, err
+
+		newDownsamplerFn := func() (downsample.Downsampler, error) {
+			return newDownsampler(cfg.Downsample, clusterClient,
+				fanoutStorage, autoMappingRules, tagOptions, instrumentOptions)
+		}
+
+		if clusterClientWaitCh != nil {
+			// Need to wait before constructing and instead return an async downsampler
+			// since the cluster client will return errors until it's initialized itself
+			// and will fail constructing the downsampler consequently
+			downsampler = downsample.NewAsyncDownsampler(func() (downsample.Downsampler, error) {
+				<-clusterClientWaitCh
+				return newDownsamplerFn()
+			}, nil)
+		} else {
+			// Otherwise we already have a client and can immediately construct the downsampler
+			downsampler, err = newDownsamplerFn()
+			if err != nil {
+				return nil, nil, nil, nil, err
+			}
 		}
 	}
 
@@ -327,9 +399,11 @@ func newM3DBStorage(
 }
 
 func newDownsampler(
+	cfg downsample.Configuration,
 	clusterManagementClient clusterclient.Client,
 	storage storage.Storage,
 	autoMappingRules []downsample.MappingRule,
+	tagOptions models.TagOptions,
 	instrumentOpts instrument.Options,
 ) (downsample.Downsampler, error) {
 	if clusterManagementClient == nil {
@@ -354,16 +428,18 @@ func newDownsampler(
 			SetMetricsScope(instrumentOpts.MetricsScope().
 				SubScope("tag-decoder-pool")))
 
-	downsampler, err := downsample.NewDownsampler(downsample.DownsamplerOptions{
-		Storage:               storage,
-		RulesKVStore:          kvStore,
-		AutoMappingRules:      autoMappingRules,
-		ClockOptions:          clock.NewOptions(),
-		InstrumentOptions:     instrumentOpts,
+	downsampler, err := cfg.NewDownsampler(downsample.DownsamplerOptions{
+		Storage:          storage,
+		RulesKVStore:     kvStore,
+		AutoMappingRules: autoMappingRules,
+		ClockOptions:     clock.NewOptions(),
+		// TODO: remove after https://github.com/m3db/m3/issues/992 is fixed
+		InstrumentOptions:     instrumentOpts.SetMetricsScope(tally.NoopScope),
 		TagEncoderOptions:     tagEncoderOptions,
 		TagDecoderOptions:     tagDecoderOptions,
 		TagEncoderPoolOptions: tagEncoderPoolOptions,
 		TagDecoderPoolOptions: tagDecoderPoolOptions,
+		TagOptions:            tagOptions,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to create downsampler")
@@ -466,13 +542,19 @@ func newStorages(
 	logger *zap.Logger,
 	clusters m3.Clusters,
 	cfg config.Configuration,
+	tagOptions models.TagOptions,
 	poolWrapper *pools.PoolWrapper,
-	workerPool pool.ObjectPool,
+	readWorkerPool xsync.PooledWorkerPool,
 	writeWorkerPool xsync.PooledWorkerPool,
 ) (storage.Storage, cleanupFn, error) {
 	cleanup := func() error { return nil }
 
-	localStorage := m3.NewStorage(clusters, workerPool, writeWorkerPool)
+	localStorage := m3.NewStorage(
+		clusters,
+		readWorkerPool,
+		writeWorkerPool,
+		tagOptions,
+	)
 	stores := []storage.Storage{localStorage}
 	remoteEnabled := false
 	if cfg.RPC != nil && cfg.RPC.Enabled {
@@ -487,7 +569,12 @@ func newStorages(
 			return nil
 		}
 
-		remoteStorage, enabled, err := remoteClient(cfg, poolWrapper, workerPool)
+		remoteStorage, enabled, err := remoteClient(
+			cfg,
+			tagOptions,
+			poolWrapper,
+			readWorkerPool,
+		)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -503,21 +590,27 @@ func newStorages(
 		readFilter = filter.AllowAll
 	}
 
-	fanoutStorage := fanout.NewStorage(stores, readFilter, filter.LocalOnly)
+	fanoutStorage := fanout.NewStorage(stores, readFilter, filter.LocalOnly, filter.RemoteOnly)
 	return fanoutStorage, cleanup, nil
 }
 
 func remoteClient(
 	cfg config.Configuration,
+	tagOptions models.TagOptions,
 	poolWrapper *pools.PoolWrapper,
-	workerPool pool.ObjectPool,
+	readWorkerPool xsync.PooledWorkerPool,
 ) (storage.Storage, bool, error) {
 	if cfg.RPC == nil {
 		return nil, false, nil
 	}
 
 	if remotes := cfg.RPC.RemoteListenAddresses; len(remotes) > 0 {
-		client, err := tsdbRemote.NewGrpcClient(remotes, poolWrapper, workerPool)
+		client, err := tsdbRemote.NewGRPCClient(
+			remotes,
+			poolWrapper,
+			readWorkerPool,
+			tagOptions,
+		)
 		if err != nil {
 			return nil, false, err
 		}

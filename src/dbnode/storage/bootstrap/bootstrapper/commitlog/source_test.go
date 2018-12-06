@@ -21,14 +21,15 @@
 package commitlog
 
 import (
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/m3db/m3/src/cluster/shard"
 	"github.com/m3db/m3/src/dbnode/persist/fs"
 	"github.com/m3db/m3/src/dbnode/storage/bootstrap/result"
 	"github.com/m3db/m3/src/dbnode/topology"
 	tu "github.com/m3db/m3/src/dbnode/topology/testutil"
-	"github.com/m3db/m3cluster/shard"
 	xtime "github.com/m3db/m3x/time"
 
 	"github.com/stretchr/testify/require"
@@ -61,6 +62,7 @@ func TestAvailableData(t *testing.T) {
 		topoState                         *topology.StateSnapshot
 		shardsTimeRangesToBootstrap       result.ShardTimeRanges
 		expectedAvailableShardsTimeRanges result.ShardTimeRanges
+		expectedErr                       error
 	}{
 		{
 			title: "Single node - Shard initializing",
@@ -77,6 +79,7 @@ func TestAvailableData(t *testing.T) {
 			}),
 			shardsTimeRangesToBootstrap:       shardTimeRangesToBootstrap,
 			expectedAvailableShardsTimeRanges: result.ShardTimeRanges{},
+			expectedErr:                       errors.New("unknown shard state: Unknown"),
 		},
 		{
 			title: "Single node - Shard leaving",
@@ -116,17 +119,26 @@ func TestAvailableData(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.title, func(t *testing.T) {
-
 			var (
-				src     = newCommitLogSource(testOptions(), fs.Inspection{})
-				runOpts = testDefaultRunOpts.SetInitialTopologyState(tc.topoState)
-				dataRes = src.AvailableData(nsMetadata, tc.shardsTimeRangesToBootstrap, runOpts)
+				src          = newCommitLogSource(testOptions(), fs.Inspection{})
+				runOpts      = testDefaultRunOpts.SetInitialTopologyState(tc.topoState)
+				dataRes, err = src.AvailableData(nsMetadata, tc.shardsTimeRangesToBootstrap, runOpts)
 			)
 
-			require.Equal(t, tc.expectedAvailableShardsTimeRanges, dataRes)
+			if tc.expectedErr != nil {
+				require.Equal(t, err, tc.expectedErr)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.expectedAvailableShardsTimeRanges, dataRes)
+			}
 
-			indexRes := src.AvailableIndex(nsMetadata, tc.shardsTimeRangesToBootstrap, runOpts)
-			require.Equal(t, tc.expectedAvailableShardsTimeRanges, indexRes)
+			indexRes, err := src.AvailableIndex(nsMetadata, tc.shardsTimeRangesToBootstrap, runOpts)
+			if tc.expectedErr != nil {
+				require.Equal(t, err, tc.expectedErr)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.expectedAvailableShardsTimeRanges, indexRes)
+			}
 		})
 	}
 }

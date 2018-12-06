@@ -32,12 +32,13 @@ import (
 	"github.com/m3db/m3/src/dbnode/network/server/tchannelthrift"
 	"github.com/m3db/m3/src/dbnode/network/server/tchannelthrift/convert"
 	tterrors "github.com/m3db/m3/src/dbnode/network/server/tchannelthrift/errors"
-	"github.com/m3db/m3/src/dbnode/serialize"
 	"github.com/m3db/m3/src/dbnode/storage"
 	"github.com/m3db/m3/src/dbnode/storage/block"
 	"github.com/m3db/m3/src/dbnode/storage/index"
+	"github.com/m3db/m3/src/dbnode/ts"
 	"github.com/m3db/m3/src/dbnode/x/xio"
 	"github.com/m3db/m3/src/dbnode/x/xpool"
+	"github.com/m3db/m3/src/x/serialize"
 	"github.com/m3db/m3x/checked"
 	"github.com/m3db/m3x/context"
 	xerrors "github.com/m3db/m3x/errors"
@@ -63,6 +64,8 @@ var (
 const (
 	initSegmentArrayPoolLength  = 4
 	maxSegmentArrayPooledLength = 32
+	// Any pooled error slices that grow beyond this capcity will be thrown away.
+	writeBatchPooledReqPoolMaxErrorsSliceSize = 4096
 )
 
 var (
@@ -131,12 +134,8 @@ type pools struct {
 	checkedBytesWrapper     xpool.CheckedBytesWrapperPool
 	segmentsArray           segmentsArrayPool
 	writeBatchPooledReqPool *writeBatchPooledReqPool
-	blockMetadata           tchannelthrift.BlockMetadataPool
 	blockMetadataV2         tchannelthrift.BlockMetadataV2Pool
-	blockMetadataSlice      tchannelthrift.BlockMetadataSlicePool
 	blockMetadataV2Slice    tchannelthrift.BlockMetadataV2SlicePool
-	blocksMetadata          tchannelthrift.BlocksMetadataPool
-	blocksMetadataSlice     tchannelthrift.BlocksMetadataSlicePool
 }
 
 // ensure `pools` matches a required conversion interface
@@ -195,12 +194,8 @@ func NewService(db storage.Database, opts tchannelthrift.Options) rpc.TChanNode 
 			id:                      db.Options().IdentifierPool(),
 			segmentsArray:           segmentPool,
 			writeBatchPooledReqPool: writeBatchPooledReqPool,
-			blockMetadata:           opts.BlockMetadataPool(),
 			blockMetadataV2:         opts.BlockMetadataV2Pool(),
-			blockMetadataSlice:      opts.BlockMetadataSlicePool(),
 			blockMetadataV2Slice:    opts.BlockMetadataV2SlicePool(),
-			blocksMetadata:          opts.BlocksMetadataPool(),
-			blocksMetadataSlice:     opts.BlocksMetadataSlicePool(),
 		},
 		health: &rpc.NodeHealthResult_{
 			Ok:           true,
@@ -455,16 +450,18 @@ func (s *service) encodeTags(
 	if err := enc.Encode(tags); err != nil {
 		// should never happen
 		err = xerrors.NewRenamedError(err, fmt.Errorf("unable to encode tags"))
-		l := instrument.EmitInvariantViolationAndGetLogger(s.opts.InstrumentOptions())
-		l.Error(err.Error())
+		instrument.EmitAndLogInvariantViolation(s.opts.InstrumentOptions(), func(l log.Logger) {
+			l.Error(err.Error())
+		})
 		return nil, err
 	}
 	encodedTags, ok := enc.Data()
 	if !ok {
 		// should never happen
 		err := fmt.Errorf("unable to encode tags: unable to unwrap bytes")
-		l := instrument.EmitInvariantViolationAndGetLogger(s.opts.InstrumentOptions())
-		l.Error(err.Error())
+		instrument.EmitAndLogInvariantViolation(s.opts.InstrumentOptions(), func(l log.Logger) {
+			l.Error(err.Error())
+		})
 		return nil, err
 	}
 	return encodedTags, nil
@@ -597,110 +594,6 @@ func (s *service) FetchBlocksRaw(tctx thrift.Context, req *rpc.FetchBlocksRawReq
 	s.metrics.fetchBlocks.ReportSuccess(s.nowFn().Sub(callStart))
 
 	return res, nil
-}
-
-func (s *service) FetchBlocksMetadataRaw(tctx thrift.Context, req *rpc.FetchBlocksMetadataRawRequest) (*rpc.FetchBlocksMetadataRawResult_, error) {
-	if s.db.IsOverloaded() {
-		s.metrics.overloadRejected.Inc(1)
-		return nil, tterrors.NewInternalError(errServerIsOverloaded)
-	}
-
-	callStart := s.nowFn()
-	ctx := tchannelthrift.Context(tctx)
-
-	start := time.Unix(0, req.RangeStart)
-	end := time.Unix(0, req.RangeEnd)
-
-	if req.Limit <= 0 {
-		s.metrics.fetchBlocksMetadata.ReportSuccess(s.nowFn().Sub(callStart))
-		return nil, nil
-	}
-
-	var pageToken int64
-	if req.PageToken != nil {
-		pageToken = *req.PageToken
-	}
-
-	var opts block.FetchBlocksMetadataOptions
-	if req.IncludeSizes != nil {
-		opts.IncludeSizes = *req.IncludeSizes
-	}
-	if req.IncludeChecksums != nil {
-		opts.IncludeChecksums = *req.IncludeChecksums
-	}
-	if req.IncludeLastRead != nil {
-		opts.IncludeLastRead = *req.IncludeLastRead
-	}
-
-	nsID := s.newID(ctx, req.NameSpace)
-
-	fetched, nextPageToken, err := s.db.FetchBlocksMetadata(ctx, nsID,
-		uint32(req.Shard), start, end, req.Limit, pageToken, opts)
-	if err != nil {
-		s.metrics.fetchBlocksMetadata.ReportError(s.nowFn().Sub(callStart))
-		return nil, convert.ToRPCError(err)
-	}
-	ctx.RegisterCloser(fetched)
-
-	fetchedResults := fetched.Results()
-	result := rpc.NewFetchBlocksMetadataRawResult_()
-	result.NextPageToken = nextPageToken
-	result.Elements = s.pools.blocksMetadataSlice.Get()
-
-	// NB(xichen): register a closer with context so objects are returned to pool
-	// when we are done using them
-	ctx.RegisterFinalizer(s.newCloseableMetadataResult(result))
-
-	for _, fetchedMetadata := range fetchedResults {
-		blocksMetadata := s.pools.blocksMetadata.Get()
-		blocksMetadata.ID = fetchedMetadata.ID.Bytes()
-		fetchedMetadataBlocks := fetchedMetadata.Blocks.Results()
-		blocksMetadata.Blocks = s.pools.blockMetadataSlice.Get()
-
-		for _, fetchedMetadataBlock := range fetchedMetadataBlocks {
-			blockMetadata := s.pools.blockMetadata.Get()
-
-			blockMetadata.Start = fetchedMetadataBlock.Start.UnixNano()
-
-			if opts.IncludeSizes {
-				size := fetchedMetadataBlock.Size
-				blockMetadata.Size = &size
-			} else {
-				blockMetadata.Size = nil
-			}
-
-			checksum := fetchedMetadataBlock.Checksum
-			if opts.IncludeChecksums && checksum != nil {
-				value := int64(*checksum)
-				blockMetadata.Checksum = &value
-			} else {
-				blockMetadata.Checksum = nil
-			}
-
-			if opts.IncludeLastRead {
-				lastRead := fetchedMetadataBlock.LastRead.UnixNano()
-				blockMetadata.LastRead = &lastRead
-				blockMetadata.LastReadTimeType = rpc.TimeType_UNIX_NANOSECONDS
-			} else {
-				blockMetadata.LastRead = nil
-				blockMetadata.LastReadTimeType = rpc.TimeType(0)
-			}
-
-			if err := fetchedMetadataBlock.Err; err != nil {
-				blockMetadata.Err = convert.ToRPCError(err)
-			} else {
-				blockMetadata.Err = nil
-			}
-
-			blocksMetadata.Blocks = append(blocksMetadata.Blocks, blockMetadata)
-		}
-
-		result.Elements = append(result.Elements, blocksMetadata)
-	}
-
-	s.metrics.fetchBlocksMetadata.ReportSuccess(s.nowFn().Sub(callStart))
-
-	return result, nil
 }
 
 func (s *service) FetchBlocksMetadataRawV2(tctx thrift.Context, req *rpc.FetchBlocksMetadataRawV2Request) (*rpc.FetchBlocksMetadataRawV2Result_, error) {
@@ -934,50 +827,58 @@ func (s *service) WriteBatchRaw(tctx thrift.Context, req *rpc.WriteBatchRawReque
 	pooledReq.writeReq = req
 	ctx.RegisterFinalizer(pooledReq)
 
-	nsID := s.newPooledID(ctx, req.NameSpace, pooledReq)
-
 	var (
-		errs               []*rpc.WriteBatchRawError
-		success            int
+		nsID               = s.newPooledID(ctx, req.NameSpace, pooledReq)
 		retryableErrors    int
 		nonRetryableErrors int
 	)
+
+	batchWriter, err := s.db.BatchWriter(nsID, len(req.Elements))
+	if err != nil {
+		return err
+	}
+
 	for i, elem := range req.Elements {
 		unit, unitErr := convert.ToUnit(elem.Datapoint.TimestampTimeType)
 		if unitErr != nil {
 			nonRetryableErrors++
-			errs = append(errs, tterrors.NewBadRequestWriteBatchRawError(i, unitErr))
+			pooledReq.addError(tterrors.NewBadRequestWriteBatchRawError(i, unitErr))
 			continue
 		}
 
 		d, err := unit.Value()
 		if err != nil {
 			nonRetryableErrors++
-			errs = append(errs, tterrors.NewBadRequestWriteBatchRawError(i, err))
+			pooledReq.addError(tterrors.NewBadRequestWriteBatchRawError(i, err))
 			continue
 		}
 
 		seriesID := s.newPooledID(ctx, elem.ID, pooledReq)
-		if err = s.db.Write(
-			ctx, nsID, seriesID,
+		batchWriter.Add(
+			i,
+			seriesID,
 			xtime.FromNormalizedTime(elem.Datapoint.Timestamp, d),
-			elem.Datapoint.Value, unit, elem.Datapoint.Annotation,
-		); err != nil && xerrors.IsInvalidParams(err) {
-			nonRetryableErrors++
-			errs = append(errs, tterrors.NewBadRequestWriteBatchRawError(i, err))
-		} else if err != nil {
-			retryableErrors++
-			errs = append(errs, tterrors.NewWriteBatchRawError(i, err))
-		} else {
-			success++
-		}
+			elem.Datapoint.Value,
+			unit,
+			elem.Datapoint.Annotation,
+		)
 	}
 
-	s.metrics.writeBatchRaw.ReportSuccess(success)
+	err = s.db.WriteBatch(ctx, nsID, batchWriter.(ts.WriteBatch), pooledReq)
+	if err != nil {
+		return err
+	}
+
+	nonRetryableErrors += pooledReq.numNonRetryableErrors()
+	retryableErrors += pooledReq.numRetryableErrors()
+	totalErrors := nonRetryableErrors + retryableErrors
+
+	s.metrics.writeBatchRaw.ReportSuccess(len(req.Elements) - totalErrors)
 	s.metrics.writeBatchRaw.ReportRetryableErrors(retryableErrors)
 	s.metrics.writeBatchRaw.ReportNonRetryableErrors(nonRetryableErrors)
 	s.metrics.writeBatchRaw.ReportLatency(s.nowFn().Sub(callStart))
 
+	errs := pooledReq.writeBatchRawErrors()
 	if len(errs) > 0 {
 		batchErrs := rpc.NewWriteBatchRawErrors()
 		batchErrs.Errors = errs
@@ -999,57 +900,65 @@ func (s *service) WriteTaggedBatchRaw(tctx thrift.Context, req *rpc.WriteTaggedB
 	pooledReq.writeTaggedReq = req
 	ctx.RegisterFinalizer(pooledReq)
 
-	nsID := s.newPooledID(ctx, req.NameSpace, pooledReq)
-
 	var (
-		errs               []*rpc.WriteBatchRawError
-		success            int
+		nsID               = s.newPooledID(ctx, req.NameSpace, pooledReq)
 		retryableErrors    int
 		nonRetryableErrors int
 	)
+
+	batchWriter, err := s.db.BatchWriter(nsID, len(req.Elements))
+	if err != nil {
+		return err
+	}
+
 	for i, elem := range req.Elements {
 		unit, unitErr := convert.ToUnit(elem.Datapoint.TimestampTimeType)
 		if unitErr != nil {
 			nonRetryableErrors++
-			errs = append(errs, tterrors.NewBadRequestWriteBatchRawError(i, unitErr))
+			pooledReq.addError(tterrors.NewBadRequestWriteBatchRawError(i, unitErr))
 			continue
 		}
 
 		d, err := unit.Value()
 		if err != nil {
 			nonRetryableErrors++
-			errs = append(errs, tterrors.NewBadRequestWriteBatchRawError(i, err))
+			pooledReq.addError(tterrors.NewBadRequestWriteBatchRawError(i, err))
 			continue
 		}
 
 		dec, err := s.newPooledTagsDecoder(ctx, elem.EncodedTags, pooledReq)
 		if err != nil {
 			nonRetryableErrors++
-			errs = append(errs, tterrors.NewBadRequestWriteBatchRawError(i, err))
+			pooledReq.addError(tterrors.NewBadRequestWriteBatchRawError(i, err))
 			continue
 		}
 
 		seriesID := s.newPooledID(ctx, elem.ID, pooledReq)
-		if err = s.db.WriteTagged(
-			ctx, nsID, seriesID, dec,
+		batchWriter.AddTagged(
+			i,
+			seriesID,
+			dec,
 			xtime.FromNormalizedTime(elem.Datapoint.Timestamp, d),
-			elem.Datapoint.Value, unit, elem.Datapoint.Annotation,
-		); err != nil && xerrors.IsInvalidParams(err) {
-			nonRetryableErrors++
-			errs = append(errs, tterrors.NewBadRequestWriteBatchRawError(i, err))
-		} else if err != nil {
-			retryableErrors++
-			errs = append(errs, tterrors.NewWriteBatchRawError(i, err))
-		} else {
-			success++
-		}
+			elem.Datapoint.Value,
+			unit,
+			elem.Datapoint.Annotation)
 	}
 
-	s.metrics.writeTaggedBatchRaw.ReportSuccess(success)
+	err = s.db.WriteTaggedBatch(ctx, nsID, batchWriter, pooledReq)
+	if err != nil {
+		return err
+	}
+
+	nonRetryableErrors += pooledReq.numNonRetryableErrors()
+	retryableErrors += pooledReq.numRetryableErrors()
+	totalErrors := nonRetryableErrors + retryableErrors
+
+	s.metrics.writeTaggedBatchRaw.ReportSuccess(len(req.Elements) - totalErrors)
 	s.metrics.writeTaggedBatchRaw.ReportRetryableErrors(retryableErrors)
 	s.metrics.writeTaggedBatchRaw.ReportNonRetryableErrors(nonRetryableErrors)
 	s.metrics.writeTaggedBatchRaw.ReportLatency(s.nowFn().Sub(callStart))
 
+	errs := pooledReq.writeBatchRawErrors()
 	if len(errs) > 0 {
 		batchErrs := rpc.NewWriteBatchRawErrors()
 		batchErrs.Errors = errs
@@ -1292,28 +1201,6 @@ func (s *service) newPooledTagsDecoder(
 	return s.newTagsDecoder(ctx, encodedTags)
 }
 
-func (s *service) newCloseableMetadataResult(
-	res *rpc.FetchBlocksMetadataRawResult_,
-) closeableMetadataResult {
-	return closeableMetadataResult{s: s, result: res}
-}
-
-type closeableMetadataResult struct {
-	s      *service
-	result *rpc.FetchBlocksMetadataRawResult_
-}
-
-func (c closeableMetadataResult) Finalize() {
-	for _, blocksMetadata := range c.result.Elements {
-		for _, blockMetadata := range blocksMetadata.Blocks {
-			c.s.pools.blockMetadata.Put(blockMetadata)
-		}
-		c.s.pools.blockMetadataSlice.Put(blocksMetadata.Blocks)
-		c.s.pools.blocksMetadata.Put(blocksMetadata)
-	}
-	c.s.pools.blocksMetadataSlice.Put(c.result.Elements)
-}
-
 func (s *service) newCloseableMetadataV2Result(
 	res *rpc.FetchBlocksMetadataRawV2Result_,
 ) closeableMetadataV2Result {
@@ -1337,6 +1224,17 @@ type writeBatchPooledReq struct {
 	pooledIDsUsed  int
 	writeReq       *rpc.WriteBatchRawRequest
 	writeTaggedReq *rpc.WriteTaggedBatchRawRequest
+
+	// We want to avoid allocating an intermediary slice of []error so we
+	// just include all the error handling in this struct for performance
+	// reasons since its pooled on a per-request basis anyways. This allows
+	// us to use this object as a storage.IndexedErrorHandler and avoid allocating
+	// []error in the storage package, as well as pool the []*rpc.WriteBatchRawError,
+	// although the individual *rpc.WriteBatchRawError still need to be allocated
+	// each time.
+	nonRetryableErrors int
+	retryableErrors    int
+	errs               []*rpc.WriteBatchRawError
 
 	pool *writeBatchPooledReqPool
 }
@@ -1395,8 +1293,53 @@ func (r *writeBatchPooledReq) Finalize() {
 		r.writeTaggedReq = nil
 	}
 
+	r.nonRetryableErrors = 0
+	r.retryableErrors = 0
+	if cap(r.errs) <= writeBatchPooledReqPoolMaxErrorsSliceSize {
+		r.errs = r.errs[:0]
+	} else {
+		// Slice grew too large, throw it away and let a new one be
+		// allocated on the next append call.
+		r.errs = nil
+	}
+
 	// Return to pool
 	r.pool.Put(r)
+}
+
+func (r *writeBatchPooledReq) HandleError(index int, err error) {
+	if err == nil {
+		return
+	}
+
+	if xerrors.IsInvalidParams(err) {
+		r.nonRetryableErrors++
+		r.errs = append(
+			r.errs,
+			tterrors.NewBadRequestWriteBatchRawError(index, err))
+		return
+	}
+
+	r.retryableErrors++
+	r.errs = append(
+		r.errs,
+		tterrors.NewWriteBatchRawError(index, err))
+}
+
+func (r *writeBatchPooledReq) addError(err *rpc.WriteBatchRawError) {
+	r.errs = append(r.errs, err)
+}
+
+func (r *writeBatchPooledReq) writeBatchRawErrors() []*rpc.WriteBatchRawError {
+	return r.errs
+}
+
+func (r *writeBatchPooledReq) numRetryableErrors() int {
+	return r.retryableErrors
+}
+
+func (r *writeBatchPooledReq) numNonRetryableErrors() int {
+	return r.nonRetryableErrors
 }
 
 type writeBatchPooledReqID struct {

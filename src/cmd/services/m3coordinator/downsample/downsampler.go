@@ -22,13 +22,13 @@ package downsample
 
 // Downsampler is a downsampler.
 type Downsampler interface {
-	NewMetricsAppender() MetricsAppender
+	NewMetricsAppender() (MetricsAppender, error)
 }
 
 // MetricsAppender is a metrics appender that can build a samples
 // appender, only valid to use with a single caller at a time.
 type MetricsAppender interface {
-	AddTag(name, value string)
+	AddTag(name, value []byte)
 	SamplesAppender() (SamplesAppender, error)
 	Reset()
 	Finalize()
@@ -46,30 +46,15 @@ type downsampler struct {
 	agg  agg
 }
 
-// NewDownsampler returns a new downsampler.
-func NewDownsampler(
-	opts DownsamplerOptions,
-) (Downsampler, error) {
-	agg, err := opts.newAggregator()
-	if err != nil {
-		return nil, err
-	}
-
-	return &downsampler{
-		opts: opts,
-		agg:  agg,
-	}, nil
-}
-
-func (d *downsampler) NewMetricsAppender() MetricsAppender {
+func (d *downsampler) NewMetricsAppender() (MetricsAppender, error) {
 	return newMetricsAppender(metricsAppenderOptions{
 		agg: d.agg.aggregator,
-		defaultStagedMetadatas:  d.agg.defaultStagedMetadatas,
-		clockOpts:               d.agg.clockOpts,
-		tagEncoder:              d.agg.pools.tagEncoderPool.Get(),
-		matcher:                 d.agg.matcher,
-		encodedTagsIteratorPool: d.agg.pools.encodedTagsIteratorPool,
-	})
+		defaultStagedMetadatas: d.agg.defaultStagedMetadatas,
+		clockOpts:              d.agg.clockOpts,
+		tagEncoder:             d.agg.pools.tagEncoderPool.Get(),
+		matcher:                d.agg.matcher,
+		metricTagsIteratorPool: d.agg.pools.metricTagsIteratorPool,
+	}), nil
 }
 
 func newMetricsAppender(opts metricsAppenderOptions) *metricsAppender {

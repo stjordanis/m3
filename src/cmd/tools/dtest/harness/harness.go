@@ -1,3 +1,23 @@
+// Copyright (c) 2018 Uber Technologies, Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
 package harness
 
 import (
@@ -13,6 +33,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	etcdclient "github.com/m3db/m3/src/cluster/client/etcd"
+	"github.com/m3db/m3/src/cluster/placement"
+	"github.com/m3db/m3/src/cluster/services"
+	"github.com/m3db/m3/src/cluster/shard"
 	"github.com/m3db/m3/src/cmd/tools/dtest/config"
 	"github.com/m3db/m3/src/cmd/tools/dtest/util"
 	"github.com/m3db/m3/src/cmd/tools/dtest/util/seed"
@@ -23,15 +47,11 @@ import (
 	"github.com/m3db/m3/src/dbnode/storage/namespace"
 	"github.com/m3db/m3/src/dbnode/x/m3em/convert"
 	m3emnode "github.com/m3db/m3/src/dbnode/x/m3em/node"
-	etcdclient "github.com/m3db/m3cluster/client/etcd"
-	"github.com/m3db/m3cluster/placement"
-	"github.com/m3db/m3cluster/services"
-	"github.com/m3db/m3cluster/shard"
-	"github.com/m3db/m3em/build"
-	"github.com/m3db/m3em/cluster"
-	hb "github.com/m3db/m3em/generated/proto/heartbeat"
-	"github.com/m3db/m3em/node"
-	xgrpc "github.com/m3db/m3em/x/grpc"
+	"github.com/m3db/m3/src/m3em/build"
+	"github.com/m3db/m3/src/m3em/cluster"
+	hb "github.com/m3db/m3/src/m3em/generated/proto/heartbeat"
+	"github.com/m3db/m3/src/m3em/node"
+	xgrpc "github.com/m3db/m3/src/m3em/x/grpc"
 	m3xclock "github.com/m3db/m3x/clock"
 	xerrors "github.com/m3db/m3x/errors"
 	"github.com/m3db/m3x/ident"
@@ -407,7 +427,7 @@ func (dt *DTestHarness) WaitUntilAllShardsAvailable() error {
 
 // AllShardsAvailable returns if the placement service has all shards marked available
 func (dt *DTestHarness) AllShardsAvailable() bool {
-	p, _, err := dt.placementService.Placement()
+	p, err := dt.placementService.Placement()
 	if err != nil {
 		return false
 	}
@@ -430,7 +450,7 @@ func (dt *DTestHarness) AllShardsAvailable() bool {
 // AnyInstanceShardHasState returns a flag if the placement service has any instance
 // with the specified shard state
 func (dt *DTestHarness) AnyInstanceShardHasState(id string, state shard.State) bool {
-	p, _, err := dt.placementService.Placement()
+	p, err := dt.placementService.Placement()
 	if err != nil {
 		return false
 	}

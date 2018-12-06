@@ -23,21 +23,32 @@ package config
 import (
 	"time"
 
+	etcdclient "github.com/m3db/m3/src/cluster/client/etcd"
+	"github.com/m3db/m3/src/cmd/services/m3coordinator/downsample"
+	"github.com/m3db/m3/src/cmd/services/m3coordinator/ingest"
+	"github.com/m3db/m3/src/cmd/services/m3coordinator/server/m3msg"
+	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/storage/m3"
-	etcdclient "github.com/m3db/m3cluster/client/etcd"
+	xconfig "github.com/m3db/m3x/config"
 	"github.com/m3db/m3x/config/listenaddress"
 	"github.com/m3db/m3x/instrument"
 )
 
-// BackendStorageType is an enum for different backends
+// BackendStorageType is an enum for different backends.
 type BackendStorageType string
 
 const (
-	// GRPCStorageType is for backends which only support grpc endpoints
+	// GRPCStorageType is for backends which only support grpc endpoints.
 	GRPCStorageType BackendStorageType = "grpc"
-	// M3DBStorageType is for m3db backend
+	// M3DBStorageType is for m3db backend.
 	M3DBStorageType BackendStorageType = "m3db"
 )
+
+// defaultLimitsConfiguration is applied if `limits` isn't specified.
+var defaultLimitsConfiguration = &LimitsConfiguration{
+	// this is sufficient for 1 day span / 1s step, or 60 days with a 1m step.
+	MaxComputedDatapoints: 86400,
+}
 
 // Configuration is the configuration for the query service.
 type Configuration struct {
@@ -65,15 +76,37 @@ type Configuration struct {
 	// Backend is the backend store for query service. We currently support grpc and m3db (default).
 	Backend BackendStorageType `yaml:"backend"`
 
-	// DecompressWorkerPoolCount is the number of decompression worker pools.
-	DecompressWorkerPoolCount int `yaml:"workerPoolCount"`
+	// TagOptions is the tag configuration options.
+	TagOptions TagOptionsConfiguration `yaml:"tagOptions"`
 
-	// DecompressWorkerPoolSize is the size of the worker pool given to each
-	// fetch request.
-	DecompressWorkerPoolSize int `yaml:"decompressWorkerPoolSize"`
+	// ReadWorkerPool is the worker pool policy for read requests.
+	ReadWorkerPool xconfig.WorkerPoolPolicy `yaml:"readWorkerPoolPolicy"`
 
-	// WriteWorkerPoolSize is the size of the worker pool write requests.
-	WriteWorkerPoolSize int `yaml:"writeWorkerPoolSize"`
+	// WriteWorkerPool is the worker pool policy for write requests.
+	WriteWorkerPool xconfig.WorkerPoolPolicy `yaml:"writeWorkerPoolPolicy"`
+
+	// Downsample configurates how the metrics should be downsampled.
+	Downsample downsample.Configuration `yaml:"downsample"`
+
+	// Ingest is the ingest server.
+	Ingest *IngestConfiguration `yaml:"ingest"`
+
+	// Limits specifies limits on per-query resource usage.
+	Limits LimitsConfiguration `yaml:"limits"`
+}
+
+// LimitsConfiguration represents limitations on per-query resource usage. Zero or negative values imply no limit.
+type LimitsConfiguration struct {
+	MaxComputedDatapoints int64 `yaml:"maxComputedDatapoints"`
+}
+
+// IngestConfiguration is the configuration for ingestion server.
+type IngestConfiguration struct {
+	// Ingester is the configuration for storage based ingester.
+	Ingester ingest.Configuration `yaml:"ingester"`
+
+	// M3Msg is the configuration for m3msg server.
+	M3Msg m3msg.Configuration `yaml:"m3msg"`
 }
 
 // LocalConfiguration is the local embedded configuration if running
@@ -105,4 +138,28 @@ type RPCConfiguration struct {
 	// RemoteListenAddresses is the remote listen addresses to call for remote
 	// coordinator calls.
 	RemoteListenAddresses []string `yaml:"remoteListenAddresses"`
+}
+
+// TagOptionsConfiguration is the configuration for shared tag options
+// Currently only name, but can expand to cover deduplication settings, or other
+// relevant options.
+type TagOptionsConfiguration struct {
+	// MetricName specifies the tag name that corresponds to the metric's name tag
+	// If not provided, defaults to `__name__`
+	MetricName string `yaml:"metricName"`
+}
+
+// TagOptionsFromConfig translates tag option configuration into tag options.
+func TagOptionsFromConfig(cfg TagOptionsConfiguration) (models.TagOptions, error) {
+	opts := models.NewTagOptions()
+	name := cfg.MetricName
+	if name != "" {
+		opts = opts.SetMetricName([]byte(name))
+	}
+
+	if err := opts.Validate(); err != nil {
+		return nil, err
+	}
+
+	return opts, nil
 }

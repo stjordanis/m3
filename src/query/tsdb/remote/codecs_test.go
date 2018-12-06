@@ -30,6 +30,7 @@ import (
 	rpc "github.com/m3db/m3/src/query/generated/proto/rpcpb"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/storage"
+	"github.com/m3db/m3/src/query/test"
 	"github.com/m3db/m3/src/query/util/logging"
 
 	"github.com/stretchr/testify/assert"
@@ -56,8 +57,8 @@ var (
 
 	time1 = "2093-02-06T11:54:48+07:00"
 
-	tags0 = models.Tags{{Name: "a", Value: "b"}, {Name: "c", Value: "d"}}
-	tags1 = models.Tags{{Name: "e", Value: "f"}, {Name: "g", Value: "h"}}
+	tags0 = test.StringTagsToTags(test.StringTags{{N: "a", V: "b"}, {N: "c", V: "d"}})
+	tags1 = test.StringTagsToTags(test.StringTags{{N: "e", V: "f"}, {N: "g", V: "h"}})
 )
 
 func parseTimes(t *testing.T) (time.Time, time.Time) {
@@ -95,14 +96,17 @@ func createRPCSeries() []*rpc.DecompressedSeries {
 func TestDecodeFetchResult(t *testing.T) {
 	rpcSeries := createRPCSeries()
 	name := "name"
+	metricName := []byte("!")
 
-	tsSeries, err := DecodeDecompressedFetchResult(name, rpcSeries)
+	tsSeries, err := decodeDecompressedFetchResult(name, models.NewTagOptions().SetMetricName(metricName), rpcSeries)
 	assert.NoError(t, err)
 	assert.Len(t, tsSeries, 3)
 	assert.Equal(t, name, tsSeries[0].Name())
 	assert.Equal(t, name, tsSeries[1].Name())
-	assert.Equal(t, models.Tags(tags0), tsSeries[0].Tags)
-	assert.Equal(t, models.Tags(tags1), tsSeries[1].Tags)
+	assert.Equal(t, tags0.Tags, tsSeries[0].Tags.Tags)
+	assert.Equal(t, metricName, tsSeries[0].Tags.Opts.MetricName())
+	assert.Equal(t, tags1.Tags, tsSeries[1].Tags.Tags)
+	assert.Equal(t, metricName, tsSeries[1].Tags.Opts.MetricName())
 
 	assert.Equal(t, len(valList0), tsSeries[0].Len())
 	assert.Equal(t, len(valList1), tsSeries[1].Len())
@@ -123,7 +127,7 @@ func TestDecodeFetchResult(t *testing.T) {
 
 	// Encode again
 	fetchResult := &storage.FetchResult{SeriesList: tsSeries}
-	revert := EncodeFetchResult(fetchResult)
+	revert := encodeFetchResult(fetchResult)
 	require.Len(t, revert.GetSeries(), len(rpcSeries))
 	for i, expected := range rpcSeries {
 		assert.Equal(t, expected.GetDatapoints(), revert.GetSeries()[i].GetDecompressed().GetDatapoints())
@@ -146,13 +150,13 @@ func readQueriesAreEqual(t *testing.T, this, other *storage.FetchQuery) {
 }
 
 func createStorageFetchQuery(t *testing.T) (*storage.FetchQuery, time.Time, time.Time) {
-	m0, err := models.NewMatcher(models.MatchRegexp, string(name0), string(val0))
+	m0, err := models.NewMatcher(models.MatchRegexp, name0, val0)
 	require.Nil(t, err)
-	m1, err := models.NewMatcher(models.MatchEqual, string(name1), string(val1))
+	m1, err := models.NewMatcher(models.MatchEqual, name1, val1)
 	require.Nil(t, err)
 	start, end := parseTimes(t)
 
-	matchers := []*models.Matcher{m0, m1}
+	matchers := []models.Matcher{m0, m1}
 	return &storage.FetchQuery{
 		TagMatchers: matchers,
 		Start:       start,
@@ -163,7 +167,7 @@ func createStorageFetchQuery(t *testing.T) (*storage.FetchQuery, time.Time, time
 func TestEncodeFetchMessage(t *testing.T) {
 	rQ, start, end := createStorageFetchQuery(t)
 
-	grpcQ, err := EncodeFetchRequest(rQ)
+	grpcQ, err := encodeFetchRequest(rQ)
 	require.NotNil(t, grpcQ)
 	require.NoError(t, err)
 	assert.Equal(t, fromTime(start), grpcQ.GetStart())
@@ -180,19 +184,19 @@ func TestEncodeFetchMessage(t *testing.T) {
 
 func TestEncodeDecodeFetchQuery(t *testing.T) {
 	rQ, _, _ := createStorageFetchQuery(t)
-	gq, err := EncodeFetchRequest(rQ)
+	gq, err := encodeFetchRequest(rQ)
 	require.NoError(t, err)
-	reverted, err := DecodeFetchRequest(gq)
+	reverted, err := decodeFetchRequest(gq)
 	require.NoError(t, err)
 	readQueriesAreEqual(t, rQ, reverted)
 
 	// Encode again
-	gqr, err := EncodeFetchRequest(reverted)
+	gqr, err := encodeFetchRequest(reverted)
 	require.NoError(t, err)
 	assert.Equal(t, gq, gqr)
 }
 
-func TestEncodeMetadata(t *testing.T) {
+func TestencodeMetadata(t *testing.T) {
 	headers := make(http.Header)
 	headers.Add("Foo", "bar")
 	headers.Add("Foo", "baz")
@@ -201,7 +205,7 @@ func TestEncodeMetadata(t *testing.T) {
 	ctx := context.WithValue(context.TODO(), handler.HeaderKey, headers)
 	requestID := "requestID"
 
-	encodedCtx := EncodeMetadata(ctx, requestID)
+	encodedCtx := encodeMetadata(ctx, requestID)
 	md, ok := metadata.FromOutgoingContext(encodedCtx)
 	require.True(t, ok)
 	assert.Equal(t, []string{"bar", "baz", "abc"}, md["foo"], "metadat keys must be lower case")
@@ -220,7 +224,7 @@ func TestRetrieveMetadata(t *testing.T) {
 	requestID := "requestID"
 	headers[reqIDKey] = []string{requestID}
 	ctx := metadata.NewIncomingContext(context.TODO(), metadata.MD(headers))
-	encodedCtx := RetrieveMetadata(ctx)
+	encodedCtx := retrieveMetadata(ctx)
 
 	require.Equal(t, requestID, logging.ReadContextID(encodedCtx))
 }

@@ -116,10 +116,10 @@ func TestScalars(t *testing.T) {
 			c, sink := executor.NewControllerWithSink(parser.NodeID(2))
 			node := op.(baseOp).Node(c, transform.Options{})
 
-			err = node.Process(parser.NodeID(0), block.NewScalar(tt.lVal, bounds))
+			err = node.Process(parser.NodeID(0), block.NewScalar(func(_ time.Time) float64 { return tt.lVal }, bounds))
 			require.NoError(t, err)
 
-			err = node.Process(parser.NodeID(1), block.NewScalar(tt.rVal, bounds))
+			err = node.Process(parser.NodeID(1), block.NewScalar(func(_ time.Time) float64 { return tt.rVal }, bounds))
 			require.NoError(t, err)
 
 			expected := [][]float64{{
@@ -130,11 +130,11 @@ func TestScalars(t *testing.T) {
 			test.EqualsWithNans(t, expected, sink.Values)
 
 			assert.Equal(t, bounds, sink.Meta.Bounds)
-			assert.Len(t, sink.Meta.Tags, 0)
+			assert.Equal(t, 0, sink.Meta.Tags.Len())
 
 			assert.Len(t, sink.Metas, 1)
 			assert.Equal(t, "", sink.Metas[0].Name)
-			assert.Len(t, sink.Metas[0].Tags, 0)
+			assert.Equal(t, 0, sink.Metas[0].Tags.Len())
 		})
 	}
 }
@@ -160,10 +160,10 @@ func TestScalarsReturnBoolFalse(t *testing.T) {
 			c, sink := executor.NewControllerWithSink(parser.NodeID(2))
 			node := op.(baseOp).Node(c, transform.Options{})
 
-			err = node.Process(parser.NodeID(0), block.NewScalar(tt.lVal, bounds))
+			err = node.Process(parser.NodeID(0), block.NewScalar(func(_ time.Time) float64 { return tt.lVal }, bounds))
 			require.NoError(t, err)
 
-			err = node.Process(parser.NodeID(1), block.NewScalar(tt.rVal, bounds))
+			err = node.Process(parser.NodeID(1), block.NewScalar(func(_ time.Time) float64 { return tt.rVal }, bounds))
 
 			if tt.opType == EqType || tt.opType == NotEqType ||
 				tt.opType == GreaterType || tt.opType == LesserType ||
@@ -182,11 +182,11 @@ func TestScalarsReturnBoolFalse(t *testing.T) {
 			test.EqualsWithNans(t, expected, sink.Values)
 
 			assert.Equal(t, bounds, sink.Meta.Bounds)
-			assert.Len(t, sink.Meta.Tags, 0)
+			assert.Equal(t, 0, sink.Meta.Tags.Len())
 
 			assert.Len(t, sink.Metas, 1)
 			assert.Equal(t, "", sink.Metas[0].Name)
-			assert.Len(t, sink.Metas[0].Tags, 0)
+			assert.Equal(t, 0, sink.Metas[0].Tags.Len())
 		})
 	}
 }
@@ -513,10 +513,10 @@ func TestSingleSeriesReturnBool(t *testing.T) {
 				err = node.Process(parser.NodeID(0), series)
 				require.NoError(t, err)
 
-				err = node.Process(parser.NodeID(1), block.NewScalar(tt.scalarVal, bounds))
+				err = node.Process(parser.NodeID(1), block.NewScalar(func(_ time.Time) float64 { return tt.scalarVal }, bounds))
 				require.NoError(t, err)
 			} else {
-				err = node.Process(parser.NodeID(0), block.NewScalar(tt.scalarVal, bounds))
+				err = node.Process(parser.NodeID(0), block.NewScalar(func(_ time.Time) float64 { return tt.scalarVal }, bounds))
 				require.NoError(t, err)
 
 				err = node.Process(parser.NodeID(1), series)
@@ -526,7 +526,7 @@ func TestSingleSeriesReturnBool(t *testing.T) {
 			test.EqualsWithNans(t, tt.expectedBool, sink.Values)
 
 			assert.Equal(t, bounds, sink.Meta.Bounds)
-			assert.Len(t, sink.Meta.Tags, 0)
+			assert.Equal(t, 0, sink.Meta.Tags.Len())
 
 			assert.Equal(t, metas, sink.Metas)
 		})
@@ -568,10 +568,10 @@ func TestSingleSeriesReturnValues(t *testing.T) {
 				err = node.Process(parser.NodeID(0), series)
 				require.NoError(t, err)
 
-				err = node.Process(parser.NodeID(1), block.NewScalar(tt.scalarVal, bounds))
+				err = node.Process(parser.NodeID(1), block.NewScalar(func(_ time.Time) float64 { return tt.scalarVal }, bounds))
 				require.NoError(t, err)
 			} else {
-				err = node.Process(parser.NodeID(0), block.NewScalar(tt.scalarVal, bounds))
+				err = node.Process(parser.NodeID(0), block.NewScalar(func(_ time.Time) float64 { return tt.scalarVal }, bounds))
 				require.NoError(t, err)
 
 				err = node.Process(parser.NodeID(1), series)
@@ -581,7 +581,7 @@ func TestSingleSeriesReturnValues(t *testing.T) {
 			test.EqualsWithNans(t, tt.expected, sink.Values)
 
 			assert.Equal(t, bounds, sink.Meta.Bounds)
-			assert.Len(t, sink.Meta.Tags, 0)
+			assert.Equal(t, 0, sink.Meta.Tags.Len())
 
 			assert.Equal(t, metas, sink.Metas)
 		})

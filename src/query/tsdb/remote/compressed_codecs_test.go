@@ -28,10 +28,10 @@ import (
 
 	"github.com/m3db/m3/src/dbnode/encoding"
 	"github.com/m3db/m3/src/dbnode/encoding/m3tsz"
-	"github.com/m3db/m3/src/dbnode/serialize"
 	"github.com/m3db/m3/src/dbnode/x/xpool"
 	rpc "github.com/m3db/m3/src/query/generated/proto/rpcpb"
 	"github.com/m3db/m3/src/query/test"
+	"github.com/m3db/m3/src/x/serialize"
 	"github.com/m3db/m3x/ident"
 	"github.com/m3db/m3x/pool"
 
@@ -223,10 +223,10 @@ func TestSeriesConversionFromCompressedDataWithIteratorPool(t *testing.T) {
 	assert.False(t, ip.msiPoolUsed)
 }
 
-func TestEncodeToCompressedFetchResult(t *testing.T) {
+func TestencodeToCompressedFetchResult(t *testing.T) {
 	iters := encoding.NewSeriesIterators([]encoding.SeriesIterator{buildTestSeriesIterator(t), buildTestSeriesIterator(t)}, nil)
 	ip := &mockIteratorPool{}
-	fetchResult, err := EncodeToCompressedFetchResult(iters, ip)
+	fetchResult, err := encodeToCompressedFetchResult(iters, ip)
 	require.NoError(t, err)
 
 	require.Len(t, fetchResult.Series, 2)
@@ -246,7 +246,7 @@ func TestEncodeToCompressedFetchResult(t *testing.T) {
 
 func TestDecodeCompressedFetchResult(t *testing.T) {
 	iters := encoding.NewSeriesIterators([]encoding.SeriesIterator{buildTestSeriesIterator(t), buildTestSeriesIterator(t)}, nil)
-	fetchResult, err := EncodeToCompressedFetchResult(iters, nil)
+	fetchResult, err := encodeToCompressedFetchResult(iters, nil)
 	require.Error(t, err)
 	require.Nil(t, fetchResult)
 }
@@ -254,14 +254,14 @@ func TestDecodeCompressedFetchResult(t *testing.T) {
 func TestDecodeCompressedFetchResultWithIteratorPool(t *testing.T) {
 	ip := &mockIteratorPool{}
 	iters := encoding.NewSeriesIterators([]encoding.SeriesIterator{buildTestSeriesIterator(t), buildTestSeriesIterator(t)}, nil)
-	fetchResult, err := EncodeToCompressedFetchResult(iters, ip)
+	fetchResult, err := encodeToCompressedFetchResult(iters, ip)
 	require.NoError(t, err)
 	require.Len(t, fetchResult.Series, 2)
 	for _, series := range fetchResult.Series {
 		verifyCompressedSeries(t, series)
 	}
 
-	revertedIters, err := DecodeCompressedFetchResponse(fetchResult, ip)
+	revertedIters, err := decodeCompressedFetchResponse(fetchResult, ip)
 	require.NoError(t, err)
 	revertedIterList := revertedIters.Iters()
 	require.Len(t, revertedIterList, 2)
@@ -269,7 +269,7 @@ func TestDecodeCompressedFetchResultWithIteratorPool(t *testing.T) {
 		validateSeries(t, seriesIterator)
 	}
 
-	revertedIters, err = DecodeCompressedFetchResponse(fetchResult, ip)
+	revertedIters, err = decodeCompressedFetchResponse(fetchResult, ip)
 	require.NoError(t, err)
 	revertedIterList = revertedIters.Iters()
 	require.Len(t, revertedIterList, 2)

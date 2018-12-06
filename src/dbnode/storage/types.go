@@ -38,6 +38,7 @@ import (
 	"github.com/m3db/m3/src/dbnode/storage/namespace"
 	"github.com/m3db/m3/src/dbnode/storage/repair"
 	"github.com/m3db/m3/src/dbnode/storage/series"
+	"github.com/m3db/m3/src/dbnode/ts"
 	"github.com/m3db/m3/src/dbnode/x/xcounter"
 	"github.com/m3db/m3/src/dbnode/x/xio"
 	"github.com/m3db/m3x/context"
@@ -50,6 +51,13 @@ import (
 
 // PageToken is an opaque paging token.
 type PageToken []byte
+
+// IndexedErrorHandler can handle individual errors based on their index. It
+// is used primarily in cases where we need to handle errors in batches, but
+// want to avoid an intermediary allocation of []error.
+type IndexedErrorHandler interface {
+	HandleError(index int, err error)
+}
 
 // Database is a time series database
 type Database interface {
@@ -103,6 +111,26 @@ type Database interface {
 		annotation []byte,
 	) error
 
+	// BatchWriter returns a batch writer for the provided namespace that can
+	// be used to issue a batch of writes to either WriteBatch or WriteTaggedBatch.
+	BatchWriter(namespace ident.ID, batchSize int) (ts.BatchWriter, error)
+
+	// WriteBatch is the same as Write, but in batch.
+	WriteBatch(
+		ctx context.Context,
+		namespace ident.ID,
+		writes ts.BatchWriter,
+		errHandler IndexedErrorHandler,
+	) error
+
+	// WriteTaggedBatch is the same as WriteTagged, but in batch.
+	WriteTaggedBatch(
+		ctx context.Context,
+		namespace ident.ID,
+		writes ts.BatchWriter,
+		errHandler IndexedErrorHandler,
+	) error
+
 	// QueryIDs resolves the given query into known IDs.
 	QueryIDs(
 		ctx context.Context,
@@ -127,19 +155,6 @@ type Database interface {
 		id ident.ID,
 		starts []time.Time,
 	) ([]block.FetchBlockResult, error)
-
-	// FetchBlocksMetadata retrieves blocks metadata for a given shard, returns the
-	// fetched block metadata results, the next page token, and any error encountered.
-	// If we have fetched all the block metadata, we return nil as the next page token.
-	FetchBlocksMetadata(
-		ctx context.Context,
-		namespace ident.ID,
-		shard uint32,
-		start, end time.Time,
-		limit int64,
-		pageToken int64,
-		opts block.FetchBlocksMetadataOptions,
-	) (block.FetchBlocksMetadataResults, *int64, error)
 
 	// FetchBlocksMetadata retrieves blocks metadata for a given shard, returns the
 	// fetched block metadata results, the next page token, and any error encountered.
@@ -234,7 +249,7 @@ type databaseNamespace interface {
 		value float64,
 		unit xtime.Unit,
 		annotation []byte,
-	) error
+	) (ts.Series, error)
 
 	// WriteTagged values to the namespace for an ID
 	WriteTagged(
@@ -245,7 +260,7 @@ type databaseNamespace interface {
 		value float64,
 		unit xtime.Unit,
 		annotation []byte,
-	) error
+	) (ts.Series, error)
 
 	// QueryIDs resolves the given query into known IDs.
 	QueryIDs(
@@ -268,16 +283,6 @@ type databaseNamespace interface {
 		id ident.ID,
 		starts []time.Time,
 	) ([]block.FetchBlockResult, error)
-
-	// FetchBlocksMetadata retrieves the blocks metadata.
-	FetchBlocksMetadata(
-		ctx context.Context,
-		shardID uint32,
-		start, end time.Time,
-		limit int64,
-		pageToken int64,
-		opts block.FetchBlocksMetadataOptions,
-	) (block.FetchBlocksMetadataResults, *int64, error)
 
 	// FetchBlocksMetadata retrieves blocks metadata.
 	FetchBlocksMetadataV2(
@@ -305,7 +310,12 @@ type databaseNamespace interface {
 	) error
 
 	// Snapshot snapshots unflushed in-memory data
-	Snapshot(blockStart, snapshotTime time.Time, flush persist.DataFlush) error
+	Snapshot(
+		blockStart,
+		snapshotTime time.Time,
+		shardBootstrapStatesAtTickStart ShardBootstrapStates,
+		flush persist.DataFlush,
+	) error
 
 	// NeedsFlush returns true if the namespace needs a flush for the
 	// period: [start, end] (both inclusive).
@@ -368,7 +378,7 @@ type databaseShard interface {
 		value float64,
 		unit xtime.Unit,
 		annotation []byte,
-	) error
+	) (ts.Series, error)
 
 	// WriteTagged values to the shard for an ID
 	WriteTagged(
@@ -379,7 +389,7 @@ type databaseShard interface {
 		value float64,
 		unit xtime.Unit,
 		annotation []byte,
-	) error
+	) (ts.Series, error)
 
 	ReadEncoded(
 		ctx context.Context,
@@ -393,15 +403,6 @@ type databaseShard interface {
 		id ident.ID,
 		starts []time.Time,
 	) ([]block.FetchBlockResult, error)
-
-	// FetchBlocksMetadata retrieves the blocks metadata.
-	FetchBlocksMetadata(
-		ctx context.Context,
-		start, end time.Time,
-		limit int64,
-		pageToken int64,
-		opts block.FetchBlocksMetadataOptions,
-	) (block.FetchBlocksMetadataResults, *int64, error)
 
 	// FetchBlocksMetadataV2 retrieves blocks metadata.
 	FetchBlocksMetadataV2(
@@ -848,6 +849,12 @@ type Options interface {
 
 	// QueryIDsWorkerPool returns the QueryIDs worker pool.
 	QueryIDsWorkerPool() xsync.WorkerPool
+
+	// SetWriteBatchPool sets the WriteBatch pool.
+	SetWriteBatchPool(value *ts.WriteBatchPool) Options
+
+	// WriteBatchPool returns the WriteBatch pool.
+	WriteBatchPool() *ts.WriteBatchPool
 }
 
 // DatabaseBootstrapState stores a snapshot of the bootstrap state for all shards across all

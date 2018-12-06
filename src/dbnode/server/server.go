@@ -21,6 +21,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -32,6 +33,11 @@ import (
 	"syscall"
 	"time"
 
+	clusterclient "github.com/m3db/m3/src/cluster/client"
+	"github.com/m3db/m3/src/cluster/client/etcd"
+	"github.com/m3db/m3/src/cluster/generated/proto/commonpb"
+	"github.com/m3db/m3/src/cluster/kv"
+	"github.com/m3db/m3/src/cluster/kv/util"
 	"github.com/m3db/m3/src/cmd/services/m3dbnode/config"
 	"github.com/m3db/m3/src/dbnode/client"
 	"github.com/m3db/m3/src/dbnode/encoding"
@@ -48,7 +54,6 @@ import (
 	"github.com/m3db/m3/src/dbnode/ratelimit"
 	"github.com/m3db/m3/src/dbnode/retention"
 	m3dbruntime "github.com/m3db/m3/src/dbnode/runtime"
-	"github.com/m3db/m3/src/dbnode/serialize"
 	"github.com/m3db/m3/src/dbnode/storage"
 	"github.com/m3db/m3/src/dbnode/storage/block"
 	"github.com/m3db/m3/src/dbnode/storage/cluster"
@@ -60,12 +65,9 @@ import (
 	"github.com/m3db/m3/src/dbnode/ts"
 	"github.com/m3db/m3/src/dbnode/x/tchannel"
 	"github.com/m3db/m3/src/dbnode/x/xio"
+	xdocs "github.com/m3db/m3/src/x/docs"
 	"github.com/m3db/m3/src/x/mmap"
-	clusterclient "github.com/m3db/m3cluster/client"
-	"github.com/m3db/m3cluster/client/etcd"
-	"github.com/m3db/m3cluster/generated/proto/commonpb"
-	"github.com/m3db/m3cluster/kv"
-	"github.com/m3db/m3cluster/kv/util"
+	"github.com/m3db/m3/src/x/serialize"
 	xconfig "github.com/m3db/m3x/config"
 	"github.com/m3db/m3x/context"
 	"github.com/m3db/m3x/ident"
@@ -80,8 +82,10 @@ import (
 )
 
 const (
-	bootstrapConfigInitTimeout = 10 * time.Second
-	serverGracefulCloseTimeout = 10 * time.Second
+	bootstrapConfigInitTimeout       = 10 * time.Second
+	serverGracefulCloseTimeout       = 10 * time.Second
+	bgProcessLimitInterval           = 10 * time.Second
+	maxBgProcessLimitMonitorDuration = 5 * time.Minute
 )
 
 // RunOptions provides options for running the server
@@ -133,6 +137,7 @@ func Run(runOpts RunOptions) {
 		os.Exit(1)
 	}
 
+	go bgValidateProcessLimits(logger)
 	debug.SetGCPercent(cfg.GCPercentage)
 
 	scope, _, err := cfg.Metrics.NewRootScope()
@@ -321,6 +326,22 @@ func Run(runOpts RunOptions) {
 			cfg.CommitLog.Queue.CalculationType)
 	}
 
+	var commitLogQueueChannelSize int
+	if cfg.CommitLog.QueueChannel != nil {
+		specified := cfg.CommitLog.QueueChannel.Size
+		switch cfg.CommitLog.Queue.CalculationType {
+		case config.CalculationTypeFixed:
+			commitLogQueueChannelSize = specified
+		case config.CalculationTypePerCPU:
+			commitLogQueueChannelSize = specified * runtime.NumCPU()
+		default:
+			logger.Fatalf("unknown commit log queue channel size type: %v",
+				cfg.CommitLog.Queue.CalculationType)
+		}
+	} else {
+		commitLogQueueChannelSize = int(float64(commitLogQueueSize) / commitlog.MaximumQueueSizeQueueChannelSizeRatio)
+	}
+
 	opts = opts.SetCommitLogOptions(opts.CommitLogOptions().
 		SetInstrumentOptions(opts.InstrumentOptions()).
 		SetFilesystemOptions(fsopts).
@@ -328,6 +349,7 @@ func Run(runOpts RunOptions) {
 		SetFlushSize(cfg.CommitLog.FlushMaxBytes).
 		SetFlushInterval(cfg.CommitLog.FlushEvery).
 		SetBacklogQueueSize(commitLogQueueSize).
+		SetBacklogQueueChannelSize(commitLogQueueChannelSize).
 		SetBlockSize(cfg.CommitLog.BlockSize))
 
 	// Set the series cache policy
@@ -406,6 +428,7 @@ func Run(runOpts RunOptions) {
 		logger.Fatalf("could not initialize m3db topology: %v", err)
 	}
 
+	origin := topology.NewHost(hostID, "")
 	m3dbClient, err := cfg.Client.NewAdminClient(
 		client.ConfigurationParameters{
 			InstrumentOptions: iopts.
@@ -419,7 +442,7 @@ func Run(runOpts RunOptions) {
 			return opts.SetContextPool(opts.ContextPool()).(client.AdminOptions)
 		},
 		func(opts client.AdminOptions) client.AdminOptions {
-			return opts.SetOrigin(topology.NewHost(hostID, ""))
+			return opts.SetOrigin(origin)
 		})
 	if err != nil {
 		logger.Fatalf("could not create m3db client: %v", err)
@@ -433,32 +456,6 @@ func Run(runOpts RunOptions) {
 	clientAdminOpts := m3dbClient.Options().(client.AdminOptions)
 	kvWatchClientConsistencyLevels(envCfg.KVStore, logger,
 		clientAdminOpts, runtimeOptsMgr)
-
-	// Set bootstrap options
-	bs, err := cfg.Bootstrap.New(opts, m3dbClient)
-	if err != nil {
-		logger.Fatalf("could not create bootstrap process: %v", err)
-	}
-
-	opts = opts.SetBootstrapProcessProvider(bs)
-
-	timeout := bootstrapConfigInitTimeout
-	kvWatchBootstrappers(envCfg.KVStore, logger, timeout, cfg.Bootstrap.Bootstrappers,
-		func(bootstrappers []string) {
-			if len(bootstrappers) == 0 {
-				logger.Errorf("updated bootstrapper list is empty")
-				return
-			}
-
-			cfg.Bootstrap.Bootstrappers = bootstrappers
-			updated, err := cfg.Bootstrap.New(opts, m3dbClient)
-			if err != nil {
-				logger.Errorf("updated bootstrapper list failed: %v", err)
-				return
-			}
-
-			bs.SetBootstrapperProvider(updated.BootstrapperProvider())
-		})
 
 	// Set repair options
 	hostBlockMetadataSlicePool := repair.NewHostBlockMetadataSlicePool(
@@ -478,30 +475,54 @@ func Run(runOpts RunOptions) {
 			SetHostBlockMetadataSlicePool(hostBlockMetadataSlicePool))
 
 	// Set tchannelthrift options
-	blockMetadataPool := tchannelthrift.NewBlockMetadataPool(
-		poolOptions(policy.BlockMetadataPool, scope.SubScope("block-metadata-pool")))
-	blockMetadataSlicePool := tchannelthrift.NewBlockMetadataSlicePool(
-		capacityPoolOptions(policy.BlockMetadataSlicePool, scope.SubScope("block-metadata-slice-pool")),
-		policy.BlockMetadataSlicePool.Capacity)
-	blocksMetadataPool := tchannelthrift.NewBlocksMetadataPool(
-		poolOptions(policy.BlocksMetadataPool, scope.SubScope("blocks-metadata-pool")))
-	blocksMetadataSlicePool := tchannelthrift.NewBlocksMetadataSlicePool(
-		capacityPoolOptions(policy.BlocksMetadataSlicePool, scope.SubScope("blocks-metadata-slice-pool")),
-		policy.BlocksMetadataSlicePool.Capacity)
-
 	ttopts := tchannelthrift.NewOptions().
 		SetInstrumentOptions(opts.InstrumentOptions()).
-		SetBlockMetadataPool(blockMetadataPool).
-		SetBlockMetadataSlicePool(blockMetadataSlicePool).
-		SetBlocksMetadataPool(blocksMetadataPool).
-		SetBlocksMetadataSlicePool(blocksMetadataSlicePool).
 		SetTagEncoderPool(tagEncoderPool).
 		SetTagDecoderPool(tagDecoderPool)
 
-	db, err := cluster.NewDatabase(hostID, envCfg.TopologyInitializer, opts)
+	// Set bootstrap options - We need to create a topology map provider from the
+	// same topology that will be passed to the cluster so that when we make
+	// bootstrapping decisions they are in sync with the clustered database
+	// which is triggering the actual bootstraps. This way, when the clustered
+	// database receives a topology update and decides to kick off a bootstrap,
+	// the bootstrap process will receaive a topology map that is at least as
+	// recent as the one that triggered the bootstrap, if not newer.
+	// See GitHub issue #1013 for more details.
+	topoMapProvider := newTopoMapProvider(topo)
+	bs, err := cfg.Bootstrap.New(opts, topoMapProvider, origin, m3dbClient)
+	if err != nil {
+		logger.Fatalf("could not create bootstrap process: %v", err)
+	}
+
+	opts = opts.SetBootstrapProcessProvider(bs)
+	timeout := bootstrapConfigInitTimeout
+	kvWatchBootstrappers(envCfg.KVStore, logger, timeout, cfg.Bootstrap.Bootstrappers,
+		func(bootstrappers []string) {
+			if len(bootstrappers) == 0 {
+				logger.Errorf("updated bootstrapper list is empty")
+				return
+			}
+
+			cfg.Bootstrap.Bootstrappers = bootstrappers
+			updated, err := cfg.Bootstrap.New(opts, topoMapProvider, origin, m3dbClient)
+			if err != nil {
+				logger.Errorf("updated bootstrapper list failed: %v", err)
+				return
+			}
+
+			bs.SetBootstrapperProvider(updated.BootstrapperProvider())
+		})
+
+	// Initialize clustered database
+	clusterTopoWatch, err := topo.Watch()
+	if err != nil {
+		logger.Fatalf("could not create cluster topology watch: %v", err)
+	}
+	db, err := cluster.NewDatabase(hostID, topo, clusterTopoWatch, opts)
 	if err != nil {
 		logger.Fatalf("could not construct database: %v", err)
 	}
+
 	if err := db.Open(); err != nil {
 		logger.Fatalf("could not open database: %v", err)
 	}
@@ -613,6 +634,29 @@ func interrupt() <-chan os.Signal {
 	c := make(chan os.Signal)
 	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
 	return c
+}
+
+func bgValidateProcessLimits(logger xlog.Logger) {
+	start := time.Now()
+	t := time.NewTicker(bgProcessLimitInterval)
+	defer t.Stop()
+	for {
+		// only monitor for first `maxBgProcessLimitMonitorDuration` of process lifetime
+		if time.Since(start) > maxBgProcessLimitMonitorDuration {
+			return
+		}
+
+		err := validateProcessLimits()
+		if err == nil {
+			return
+		}
+
+		logger.WithFields(
+			xlog.NewField("url", xdocs.Path("operational_guide/kernel_configuration")),
+		).Warnf(`invalid configuration found [%v], refer to linked documentation for more information`, err)
+
+		<-t.C
+	}
 }
 
 func kvWatchNewSeriesLimitPerShard(
@@ -938,6 +982,19 @@ func withEncodingAndPoolingOptions(
 	multiIteratorPool := encoding.NewMultiReaderIteratorPool(
 		poolOptions(policy.IteratorPool, scope.SubScope("multi-iterator-pool")))
 
+	var writeBatchPoolInitialBatchSize *int
+	if policy.WriteBatchPool.InitialBatchSize != nil {
+		writeBatchPoolInitialBatchSize = policy.WriteBatchPool.InitialBatchSize
+	}
+	var writeBatchPoolMaxBatchSize *int
+	if policy.WriteBatchPool.MaxBatchSize != nil {
+		writeBatchPoolMaxBatchSize = policy.WriteBatchPool.MaxBatchSize
+	}
+	writeBatchPool := ts.NewWriteBatchPool(
+		poolOptions(policy.WriteBatchPool.Pool, scope.SubScope("write-batch-pool")),
+		writeBatchPoolInitialBatchSize,
+		writeBatchPoolMaxBatchSize)
+
 	identifierPool := ident.NewPool(bytesPool, ident.PoolOptions{
 		IDPoolOptions:           poolOptions(policy.IdentifierPool, scope.SubScope("identifier-pool")),
 		TagsPoolOptions:         maxCapacityPoolOptions(policy.TagsPool, scope.SubScope("tags-pool")),
@@ -976,6 +1033,8 @@ func withEncodingAndPoolingOptions(
 		return iter
 	})
 
+	writeBatchPool.Init()
+
 	opts = opts.
 		SetBytesPool(bytesPool).
 		SetContextPool(contextPool).
@@ -984,7 +1043,8 @@ func withEncodingAndPoolingOptions(
 		SetMultiReaderIteratorPool(multiIteratorPool).
 		SetIdentifierPool(identifierPool).
 		SetFetchBlockMetadataResultsPool(fetchBlockMetadataResultsPool).
-		SetFetchBlocksMetadataResultsPool(fetchBlocksMetadataResultsPool)
+		SetFetchBlocksMetadataResultsPool(fetchBlocksMetadataResultsPool).
+		SetWriteBatchPool(writeBatchPool)
 
 	blockOpts := opts.DatabaseBlockOptions().
 		SetDatabaseBlockAllocSize(policy.BlockAllocSize).
@@ -1140,4 +1200,20 @@ func hostSupportsHugeTLB() (bool, error) {
 	}
 	// The warning was probably caused by something else, proceed using HugeTLB
 	return true, nil
+}
+
+func newTopoMapProvider(t topology.Topology) *topoMapProvider {
+	return &topoMapProvider{t}
+}
+
+type topoMapProvider struct {
+	t topology.Topology
+}
+
+func (t *topoMapProvider) TopologyMap() (topology.Map, error) {
+	if t.t == nil {
+		return nil, errors.New("topology map provider has not be set yet")
+	}
+
+	return t.t.Get(), nil
 }

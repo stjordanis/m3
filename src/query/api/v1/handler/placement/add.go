@@ -22,70 +22,91 @@ package placement
 
 import (
 	"net/http"
+	"path"
+	"time"
 
-	"github.com/m3db/m3/src/cmd/services/m3query/config"
+	"github.com/m3db/m3/src/cluster/placement"
 	"github.com/m3db/m3/src/query/api/v1/handler"
 	"github.com/m3db/m3/src/query/generated/proto/admin"
 	"github.com/m3db/m3/src/query/util/logging"
-	clusterclient "github.com/m3db/m3cluster/client"
-	"github.com/m3db/m3cluster/placement"
+	"github.com/m3db/m3/src/x/net/http"
 
 	"github.com/gogo/protobuf/jsonpb"
 	"go.uber.org/zap"
 )
 
 const (
-	// AddURL is the url for the placement add handler (with the POST method).
-	AddURL = handler.RoutePrefixV1 + "/placement"
-
 	// AddHTTPMethod is the HTTP method used with this resource.
 	AddHTTPMethod = http.MethodPost
+)
+
+var (
+	// DeprecatedM3DBAddURL is the old url for the placement add handler, maintained for
+	// backwards compatibility.
+	DeprecatedM3DBAddURL = path.Join(handler.RoutePrefixV1, PlacementPathName)
+
+	// M3DBAddURL is the url for the placement add handler (with the POST method)
+	// for the M3DB service.
+	M3DBAddURL = path.Join(handler.RoutePrefixV1, M3DBServicePlacementPathName)
+
+	// M3AggAddURL is the url for the placement add handler (with the POST method)
+	// for the M3Agg service.
+	M3AggAddURL = path.Join(handler.RoutePrefixV1, M3AggServicePlacementPathName)
+
+	// M3CoordinatorAddURL is the url for the placement add handler (with the POST method)
+	// for the M3Coordinator service.
+	M3CoordinatorAddURL = path.Join(handler.RoutePrefixV1, M3CoordinatorServicePlacementPathName)
 )
 
 // AddHandler is the handler for placement adds.
 type AddHandler Handler
 
 // NewAddHandler returns a new instance of AddHandler.
-func NewAddHandler(client clusterclient.Client, cfg config.Configuration) *AddHandler {
-	return &AddHandler{client: client, cfg: cfg}
+func NewAddHandler(opts HandlerOptions) *AddHandler {
+	return &AddHandler{HandlerOptions: opts, nowFn: time.Now}
 }
 
-func (h *AddHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *AddHandler) ServeHTTP(serviceName string, w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	logger := logging.WithContext(ctx)
 
 	req, rErr := h.parseRequest(r)
 	if rErr != nil {
-		handler.Error(w, rErr.Inner(), rErr.Code())
+		xhttp.Error(w, rErr.Inner(), rErr.Code())
 		return
 	}
 
-	placement, err := h.Add(r, req)
+	placement, err := h.Add(serviceName, r, req)
 	if err != nil {
+		status := http.StatusInternalServerError
+		if _, ok := err.(unsafeAddError); ok {
+			status = http.StatusBadRequest
+		}
 		logger.Error("unable to add placement", zap.Any("error", err))
-		handler.Error(w, err, http.StatusInternalServerError)
+		xhttp.Error(w, err, status)
 		return
 	}
 
 	placementProto, err := placement.Proto()
 	if err != nil {
 		logger.Error("unable to get placement protobuf", zap.Any("error", err))
-		handler.Error(w, err, http.StatusInternalServerError)
+		xhttp.Error(w, err, http.StatusInternalServerError)
 		return
 	}
 
 	resp := &admin.PlacementGetResponse{
 		Placement: placementProto,
+		Version:   int32(placement.Version()),
 	}
 
-	handler.WriteProtoMsgJSONResponse(w, resp, logger)
+	xhttp.WriteProtoMsgJSONResponse(w, resp, logger)
 }
 
-func (h *AddHandler) parseRequest(r *http.Request) (*admin.PlacementAddRequest, *handler.ParseError) {
+func (h *AddHandler) parseRequest(r *http.Request) (*admin.PlacementAddRequest, *xhttp.ParseError) {
 	defer r.Body.Close()
 	addReq := new(admin.PlacementAddRequest)
 	if err := jsonpb.Unmarshal(r.Body, addReq); err != nil {
-		return nil, handler.NewParseError(err, http.StatusBadRequest)
+		return nil, xhttp.NewParseError(err, http.StatusBadRequest)
 	}
 
 	return addReq, nil
@@ -93,6 +114,7 @@ func (h *AddHandler) parseRequest(r *http.Request) (*admin.PlacementAddRequest, 
 
 // Add adds a placement.
 func (h *AddHandler) Add(
+	serviceName string,
 	httpReq *http.Request,
 	req *admin.PlacementAddRequest,
 ) (placement.Placement, error) {
@@ -101,11 +123,16 @@ func (h *AddHandler) Add(
 		return nil, err
 	}
 
-	service, err := Service(h.client, httpReq.Header)
+	serviceOpts := NewServiceOptions(
+		serviceName, httpReq.Header, h.M3AggServiceOptions)
+	var validateFn placement.ValidateFn
+	if !req.Force {
+		validateFn = validateAllAvailable
+	}
+	service, _, err := ServiceWithAlgo(h.ClusterClient, serviceOpts, h.nowFn(), validateFn)
 	if err != nil {
 		return nil, err
 	}
-
 	newPlacement, _, err := service.AddInstances(instances)
 	if err != nil {
 		return nil, err

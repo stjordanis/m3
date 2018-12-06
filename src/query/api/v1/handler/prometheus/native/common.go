@@ -27,7 +27,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/m3db/m3/src/query/api/v1/handler"
 	"github.com/m3db/m3/src/query/api/v1/handler/prometheus"
 	"github.com/m3db/m3/src/query/errors"
 	"github.com/m3db/m3/src/query/functions/utils"
@@ -36,6 +35,7 @@ import (
 	"github.com/m3db/m3/src/query/util"
 	"github.com/m3db/m3/src/query/util/json"
 	"github.com/m3db/m3/src/query/util/logging"
+	"github.com/m3db/m3/src/x/net/http"
 
 	"go.uber.org/zap"
 )
@@ -43,6 +43,7 @@ import (
 const (
 	endParam          = "end"
 	startParam        = "start"
+	timeParam         = "time"
 	queryParam        = "query"
 	stepParam         = "step"
 	debugParam        = "debug"
@@ -80,38 +81,38 @@ func parseDuration(r *http.Request, key string) (time.Duration, error) {
 }
 
 // parseParams parses all params from the GET request
-func parseParams(r *http.Request) (models.RequestParams, *handler.ParseError) {
+func parseParams(r *http.Request) (models.RequestParams, *xhttp.ParseError) {
 	params := models.RequestParams{
 		Now: time.Now(),
 	}
 
 	t, err := prometheus.ParseRequestTimeout(r)
 	if err != nil {
-		return params, handler.NewParseError(err, http.StatusBadRequest)
+		return params, xhttp.NewParseError(err, http.StatusBadRequest)
 	}
 	params.Timeout = t
 
 	start, err := parseTime(r, startParam)
 	if err != nil {
-		return params, handler.NewParseError(fmt.Errorf(formatErrStr, startParam, err), http.StatusBadRequest)
+		return params, xhttp.NewParseError(fmt.Errorf(formatErrStr, startParam, err), http.StatusBadRequest)
 	}
 	params.Start = start
 
 	end, err := parseTime(r, endParam)
 	if err != nil {
-		return params, handler.NewParseError(fmt.Errorf(formatErrStr, endParam, err), http.StatusBadRequest)
+		return params, xhttp.NewParseError(fmt.Errorf(formatErrStr, endParam, err), http.StatusBadRequest)
 	}
 	params.End = end
 
 	step, err := parseDuration(r, stepParam)
 	if err != nil {
-		return params, handler.NewParseError(fmt.Errorf(formatErrStr, stepParam, err), http.StatusBadRequest)
+		return params, xhttp.NewParseError(fmt.Errorf(formatErrStr, stepParam, err), http.StatusBadRequest)
 	}
 	params.Step = step
 
 	query, err := parseQuery(r)
 	if err != nil {
-		return params, handler.NewParseError(fmt.Errorf(formatErrStr, queryParam, err), http.StatusBadRequest)
+		return params, xhttp.NewParseError(fmt.Errorf(formatErrStr, queryParam, err), http.StatusBadRequest)
 	}
 	params.Query = query
 
@@ -140,6 +141,51 @@ func parseParams(r *http.Request) (models.RequestParams, *handler.ParseError) {
 	return params, nil
 }
 
+// parseInstantaneousParams parses all params from the GET request
+func parseInstantaneousParams(r *http.Request) (models.RequestParams, *xhttp.ParseError) {
+	params := models.RequestParams{
+		Now:        time.Now(),
+		Step:       time.Second,
+		IncludeEnd: true,
+	}
+
+	t, err := prometheus.ParseRequestTimeout(r)
+	if err != nil {
+		return params, xhttp.NewParseError(err, http.StatusBadRequest)
+	}
+
+	params.Timeout = t
+	instant := time.Now()
+	if t := r.FormValue(timeParam); t != "" {
+		instant, err = util.ParseTimeString(t)
+		if err != nil {
+			return params, xhttp.NewParseError(fmt.Errorf(formatErrStr, timeParam, err), http.StatusBadRequest)
+		}
+	}
+
+	params.Start = instant
+	params.End = instant
+
+	query, err := parseQuery(r)
+	if err != nil {
+		return params, xhttp.NewParseError(fmt.Errorf(formatErrStr, queryParam, err), http.StatusBadRequest)
+	}
+	params.Query = query
+
+	// Skip debug if unable to parse debug param
+	debugVal := r.FormValue(debugParam)
+	if debugVal != "" {
+		debug, err := strconv.ParseBool(r.FormValue(debugParam))
+		if err != nil {
+			logging.WithContext(r.Context()).Warn("unable to parse debug flag", zap.Any("error", err))
+		}
+
+		params.Debug = debug
+	}
+
+	return params, nil
+}
+
 func parseQuery(r *http.Request) (string, error) {
 	queries, ok := r.URL.Query()[queryParam]
 	if !ok || len(queries) == 0 || queries[0] == "" {
@@ -154,7 +200,11 @@ func parseQuery(r *http.Request) (string, error) {
 	return queries[0], nil
 }
 
-func renderResultsJSON(w io.Writer, series []*ts.Series, params models.RequestParams) {
+func renderResultsJSON(
+	w io.Writer,
+	series []*ts.Series,
+	params models.RequestParams,
+) {
 	jw := json.NewWriter(w)
 	jw.BeginObject()
 
@@ -173,9 +223,9 @@ func renderResultsJSON(w io.Writer, series []*ts.Series, params models.RequestPa
 		jw.BeginObject()
 		jw.BeginObjectField("metric")
 		jw.BeginObject()
-		for _, t := range s.Tags {
-			jw.BeginObjectField(t.Name)
-			jw.WriteString(t.Value)
+		for _, t := range s.Tags.Tags {
+			jw.BeginObjectField(string(t.Name))
+			jw.WriteString(string(t.Value))
 		}
 		jw.EndObject()
 
@@ -205,8 +255,55 @@ func renderResultsJSON(w io.Writer, series []*ts.Series, params models.RequestPa
 		if ok {
 			jw.BeginObjectField("step_size_ms")
 			jw.WriteInt(int(fixedStep.Resolution() / time.Millisecond))
-			jw.EndObject()
 		}
+		jw.EndObject()
+	}
+	jw.EndArray()
+
+	jw.EndObject()
+
+	jw.EndObject()
+	jw.Close()
+}
+
+func renderResultsInstantaneousJSON(
+	w io.Writer,
+	series []*ts.Series,
+	params models.RequestParams,
+) {
+	jw := json.NewWriter(w)
+	jw.BeginObject()
+
+	jw.BeginObjectField("status")
+	jw.WriteString("success")
+
+	jw.BeginObjectField("data")
+	jw.BeginObject()
+
+	jw.BeginObjectField("resultType")
+	jw.WriteString("vector")
+
+	jw.BeginObjectField("result")
+	jw.BeginArray()
+	for _, s := range series {
+		jw.BeginObject()
+		jw.BeginObjectField("metric")
+		jw.BeginObject()
+		for _, t := range s.Tags.Tags {
+			jw.BeginObjectField(string(t.Name))
+			jw.WriteString(string(t.Value))
+		}
+		jw.EndObject()
+
+		jw.BeginObjectField("value")
+		vals := s.Values()
+		length := s.Len()
+		dp := vals.DatapointAt(length - 1)
+		jw.BeginArray()
+		jw.WriteInt(int(dp.Timestamp.Unix()))
+		jw.WriteString(utils.FormatFloat(dp.Value))
+		jw.EndArray()
+		jw.EndObject()
 	}
 	jw.EndArray()
 

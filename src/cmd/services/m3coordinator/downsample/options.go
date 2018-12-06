@@ -27,25 +27,27 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/m3db/m3/src/dbnode/serialize"
+	"github.com/m3db/m3/src/aggregator/aggregator"
+	"github.com/m3db/m3/src/aggregator/aggregator/handler"
+	"github.com/m3db/m3/src/aggregator/client"
+	"github.com/m3db/m3/src/cluster/kv"
+	"github.com/m3db/m3/src/cluster/kv/mem"
+	"github.com/m3db/m3/src/cluster/placement"
+	placementservice "github.com/m3db/m3/src/cluster/placement/service"
+	placementstorage "github.com/m3db/m3/src/cluster/placement/storage"
+	"github.com/m3db/m3/src/cluster/services"
+	"github.com/m3db/m3/src/metrics/aggregation"
+	"github.com/m3db/m3/src/metrics/filters"
+	"github.com/m3db/m3/src/metrics/matcher"
+	"github.com/m3db/m3/src/metrics/matcher/cache"
+	"github.com/m3db/m3/src/metrics/metadata"
+	"github.com/m3db/m3/src/metrics/metric/id"
+	"github.com/m3db/m3/src/metrics/pipeline/applied"
+	"github.com/m3db/m3/src/metrics/policy"
+	"github.com/m3db/m3/src/metrics/rules"
+	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/storage"
-	"github.com/m3db/m3aggregator/aggregator"
-	"github.com/m3db/m3aggregator/aggregator/handler"
-	"github.com/m3db/m3aggregator/client"
-	"github.com/m3db/m3cluster/kv"
-	"github.com/m3db/m3cluster/kv/mem"
-	"github.com/m3db/m3cluster/placement"
-	placementservice "github.com/m3db/m3cluster/placement/service"
-	placementstorage "github.com/m3db/m3cluster/placement/storage"
-	"github.com/m3db/m3cluster/services"
-	"github.com/m3db/m3metrics/aggregation"
-	"github.com/m3db/m3metrics/filters"
-	"github.com/m3db/m3metrics/matcher"
-	"github.com/m3db/m3metrics/matcher/cache"
-	"github.com/m3db/m3metrics/metadata"
-	"github.com/m3db/m3metrics/metric/id"
-	"github.com/m3db/m3metrics/policy"
-	"github.com/m3db/m3metrics/rules"
+	"github.com/m3db/m3/src/x/serialize"
 	"github.com/m3db/m3x/clock"
 	"github.com/m3db/m3x/instrument"
 	"github.com/m3db/m3x/pool"
@@ -87,6 +89,7 @@ type DownsamplerOptions struct {
 	TagEncoderPoolOptions   pool.ObjectPoolOptions
 	TagDecoderPoolOptions   pool.ObjectPoolOptions
 	OpenTimeout             time.Duration
+	TagOptions              models.TagOptions
 }
 
 // MappingRule is a mapping rule to apply to metrics.
@@ -153,7 +156,37 @@ type agg struct {
 	pools                  aggPools
 }
 
-func (o DownsamplerOptions) newAggregator() (agg, error) {
+// Configuration configurates a downsampler.
+type Configuration struct {
+	// AggregationTypes configs the aggregation types.
+	AggregationTypes *aggregation.TypesConfiguration `yaml:"aggregationTypes"`
+
+	// Pool of counter elements.
+	CounterElemPool pool.ObjectPoolConfiguration `yaml:"counterElemPool"`
+
+	// Pool of timer elements.
+	TimerElemPool pool.ObjectPoolConfiguration `yaml:"timerElemPool"`
+
+	// Pool of gauge elements.
+	GaugeElemPool pool.ObjectPoolConfiguration `yaml:"gaugeElemPool"`
+}
+
+// NewDownsampler returns a new downsampler.
+func (cfg Configuration) NewDownsampler(
+	opts DownsamplerOptions,
+) (Downsampler, error) {
+	agg, err := cfg.newAggregator(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return &downsampler{
+		opts: opts,
+		agg:  agg,
+	}, nil
+}
+
+func (cfg Configuration) newAggregator(o DownsamplerOptions) (agg, error) {
 	// Validate options first.
 	if err := o.validate(); err != nil {
 		return agg{}, err
@@ -164,6 +197,7 @@ func (o DownsamplerOptions) newAggregator() (agg, error) {
 		rulesStore              = o.RulesKVStore
 		clockOpts               = o.ClockOptions
 		instrumentOpts          = o.InstrumentOptions
+		scope                   = instrumentOpts.MetricsScope()
 		openTimeout             = defaultOpenTimeout
 		defaultStagedMetadatas  []metadata.StagedMetadatas
 	)
@@ -183,13 +217,6 @@ func (o DownsamplerOptions) newAggregator() (agg, error) {
 
 	pools := o.newAggregatorPools()
 	ruleSetOpts := o.newAggregatorRulesOptions(pools)
-
-	// Use default aggregation types, in future we can provide more configurability
-	var defaultAggregationTypes aggregation.TypesConfiguration
-	aggTypeOpts, err := defaultAggregationTypes.NewOptions(instrumentOpts)
-	if err != nil {
-		return agg{}, err
-	}
 
 	matcher, err := o.newAggregatorMatcher(clockOpts, instrumentOpts,
 		ruleSetOpts, rulesStore)
@@ -235,7 +262,6 @@ func (o DownsamplerOptions) newAggregator() (agg, error) {
 	aggregatorOpts := aggregator.NewOptions().
 		SetClockOptions(clockOpts).
 		SetInstrumentOptions(instrumentOpts).
-		SetAggregationTypesOptions(aggTypeOpts).
 		SetMetricPrefix(nil).
 		SetCounterPrefix(nil).
 		SetGaugePrefix(nil).
@@ -246,6 +272,68 @@ func (o DownsamplerOptions) newAggregator() (agg, error) {
 		SetElectionManager(electionManager).
 		SetFlushManager(flushManager).
 		SetFlushHandler(flushHandler)
+
+	if cfg.AggregationTypes != nil {
+		aggTypeOpts, err := cfg.AggregationTypes.NewOptions(instrumentOpts)
+		if err != nil {
+			return agg{}, err
+		}
+		aggregatorOpts = aggregatorOpts.SetAggregationTypesOptions(aggTypeOpts)
+	}
+
+	// Set counter elem pool.
+	counterElemPoolOpts := cfg.CounterElemPool.NewObjectPoolOptions(
+		instrumentOpts.SetMetricsScope(scope.SubScope("counter-elem-pool")),
+	)
+	counterElemPool := aggregator.NewCounterElemPool(counterElemPoolOpts)
+	aggregatorOpts = aggregatorOpts.SetCounterElemPool(counterElemPool)
+	counterElemPool.Init(func() *aggregator.CounterElem {
+		return aggregator.MustNewCounterElem(
+			nil,
+			policy.EmptyStoragePolicy,
+			aggregation.DefaultTypes,
+			applied.DefaultPipeline,
+			0,
+			aggregator.WithPrefixWithSuffix,
+			aggregatorOpts,
+		)
+	})
+
+	// Set timer elem pool.
+	timerElemPoolOpts := cfg.TimerElemPool.NewObjectPoolOptions(
+		instrumentOpts.SetMetricsScope(scope.SubScope("timer-elem-pool")),
+	)
+	timerElemPool := aggregator.NewTimerElemPool(timerElemPoolOpts)
+	aggregatorOpts = aggregatorOpts.SetTimerElemPool(timerElemPool)
+	timerElemPool.Init(func() *aggregator.TimerElem {
+		return aggregator.MustNewTimerElem(
+			nil,
+			policy.EmptyStoragePolicy,
+			aggregation.DefaultTypes,
+			applied.DefaultPipeline,
+			0,
+			aggregator.WithPrefixWithSuffix,
+			aggregatorOpts,
+		)
+	})
+
+	// Set gauge elem pool.
+	gaugeElemPoolOpts := cfg.GaugeElemPool.NewObjectPoolOptions(
+		instrumentOpts.SetMetricsScope(scope.SubScope("gauge-elem-pool")),
+	)
+	gaugeElemPool := aggregator.NewGaugeElemPool(gaugeElemPoolOpts)
+	aggregatorOpts = aggregatorOpts.SetGaugeElemPool(gaugeElemPool)
+	gaugeElemPool.Init(func() *aggregator.GaugeElem {
+		return aggregator.MustNewGaugeElem(
+			nil,
+			policy.EmptyStoragePolicy,
+			aggregation.DefaultTypes,
+			applied.DefaultPipeline,
+			0,
+			aggregator.WithPrefixWithSuffix,
+			aggregatorOpts,
+		)
+	})
 
 	aggregatorInstance := aggregator.NewAggregator(aggregatorOpts)
 	if err := aggregatorInstance.Open(); err != nil {
@@ -274,9 +362,9 @@ func (o DownsamplerOptions) newAggregator() (agg, error) {
 }
 
 type aggPools struct {
-	tagEncoderPool          serialize.TagEncoderPool
-	tagDecoderPool          serialize.TagDecoderPool
-	encodedTagsIteratorPool *encodedTagsIteratorPool
+	tagEncoderPool         serialize.TagEncoderPool
+	tagDecoderPool         serialize.TagDecoderPool
+	metricTagsIteratorPool serialize.MetricTagsIteratorPool
 }
 
 func (o DownsamplerOptions) newAggregatorPools() aggPools {
@@ -288,14 +376,14 @@ func (o DownsamplerOptions) newAggregatorPools() aggPools {
 		o.TagDecoderPoolOptions)
 	tagDecoderPool.Init()
 
-	encodedTagsIteratorPool := newEncodedTagsIteratorPool(tagDecoderPool,
+	metricTagsIteratorPool := serialize.NewMetricTagsIteratorPool(tagDecoderPool,
 		o.TagDecoderPoolOptions)
-	encodedTagsIteratorPool.Init()
+	metricTagsIteratorPool.Init()
 
 	return aggPools{
-		tagEncoderPool:          tagEncoderPool,
-		tagDecoderPool:          tagDecoderPool,
-		encodedTagsIteratorPool: encodedTagsIteratorPool,
+		tagEncoderPool:         tagEncoderPool,
+		tagDecoderPool:         tagDecoderPool,
+		metricTagsIteratorPool: metricTagsIteratorPool,
 	}
 }
 
@@ -306,7 +394,7 @@ func (o DownsamplerOptions) newAggregatorRulesOptions(pools aggPools) rules.Opti
 	}
 
 	sortedTagIteratorFn := func(tagPairs []byte) id.SortedTagIterator {
-		it := pools.encodedTagsIteratorPool.Get()
+		it := pools.metricTagsIteratorPool.Get()
 		it.Reset(tagPairs)
 		return it
 	}
@@ -314,7 +402,7 @@ func (o DownsamplerOptions) newAggregatorRulesOptions(pools aggPools) rules.Opti
 	tagsFilterOpts := filters.TagsFilterOptions{
 		NameTagKey: nameTag,
 		NameAndTagsFn: func(id []byte) ([]byte, []byte, error) {
-			name, err := resolveEncodedTagsNameTag(id, pools.encodedTagsIteratorPool,
+			name, err := resolveEncodedTagsNameTag(id, pools.metricTagsIteratorPool,
 				nameTag)
 			if err != nil {
 				return nil, nil, err
@@ -327,7 +415,7 @@ func (o DownsamplerOptions) newAggregatorRulesOptions(pools aggPools) rules.Opti
 	}
 
 	isRollupIDFn := func(name []byte, tags []byte) bool {
-		return isRollupID(tags, pools.encodedTagsIteratorPool)
+		return isRollupID(tags, pools.metricTagsIteratorPool)
 	}
 
 	newRollupIDProviderPool := newRollupIDProviderPool(pools.tagEncoderPool,
@@ -448,8 +536,8 @@ func (o DownsamplerOptions) newAggregatorFlushManagerAndHandler(
 
 	flushWorkers := xsync.NewWorkerPool(storageFlushConcurrency)
 	flushWorkers.Init()
-	handler := newDownsamplerFlushHandler(o.Storage, pools.encodedTagsIteratorPool,
-		flushWorkers, instrumentOpts)
+	handler := newDownsamplerFlushHandler(o.Storage, pools.metricTagsIteratorPool,
+		flushWorkers, o.TagOptions, instrumentOpts)
 
 	return flushManager, handler
 }

@@ -28,31 +28,41 @@ import (
 
 	"github.com/m3db/m3/src/cmd/services/m3query/config"
 
+	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestPlacementDeleteAllHandler(t *testing.T) {
-	mockClient, mockPlacementService := SetupPlacementTest(t)
-	handler := NewDeleteAllHandler(mockClient, config.Configuration{})
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
 
-	// Test delete success
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/placement/delete", nil)
-	require.NotNil(t, req)
-	mockPlacementService.EXPECT().Delete()
-	handler.ServeHTTP(w, req)
+	runForAllAllowedServices(func(serviceName string) {
+		var (
+			mockClient, mockPlacementService = SetupPlacementTest(t, ctrl)
+			handlerOpts                      = NewHandlerOptions(
+				mockClient, config.Configuration{}, nil)
+			handler = NewDeleteAllHandler(handlerOpts)
+		)
 
-	resp := w.Result()
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
+		// Test delete success
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(DeleteAllHTTPMethod, M3DBDeleteAllURL, nil)
+		require.NotNil(t, req)
+		mockPlacementService.EXPECT().Delete()
+		handler.ServeHTTP(serviceName, w, req)
 
-	// Test delete error
-	w = httptest.NewRecorder()
-	req = httptest.NewRequest("POST", "/placement/delete", nil)
-	require.NotNil(t, req)
-	mockPlacementService.EXPECT().Delete().Return(errors.New("error"))
-	handler.ServeHTTP(w, req)
+		resp := w.Result()
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
 
-	resp = w.Result()
-	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+		// Test delete error
+		w = httptest.NewRecorder()
+		req = httptest.NewRequest(DeleteAllHTTPMethod, M3DBDeleteAllURL, nil)
+		require.NotNil(t, req)
+		mockPlacementService.EXPECT().Delete().Return(errors.New("error"))
+		handler.ServeHTTP(serviceName, w, req)
+
+		resp = w.Result()
+		assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+	})
 }

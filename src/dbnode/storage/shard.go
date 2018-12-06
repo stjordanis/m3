@@ -34,7 +34,6 @@ import (
 	"github.com/m3db/m3/src/dbnode/generated/proto/pagetoken"
 	"github.com/m3db/m3/src/dbnode/persist"
 	"github.com/m3db/m3/src/dbnode/persist/fs"
-	"github.com/m3db/m3/src/dbnode/persist/fs/commitlog"
 	"github.com/m3db/m3/src/dbnode/retention"
 	"github.com/m3db/m3/src/dbnode/runtime"
 	"github.com/m3db/m3/src/dbnode/storage/block"
@@ -146,7 +145,6 @@ type dbShard struct {
 	namespaceReaderMgr       databaseNamespaceReaderManager
 	increasingIndex          increasingIndex
 	seriesPool               series.DatabaseSeriesPool
-	commitLogWriter          commitLogWriter
 	reverseIndex             namespaceIndex
 	insertQueue              *dbShardInsertQueue
 	lookup                   *shardMap
@@ -243,7 +241,6 @@ func newDatabaseShard(
 	blockRetriever block.DatabaseBlockRetriever,
 	namespaceReaderMgr databaseNamespaceReaderManager,
 	increasingIndex increasingIndex,
-	commitLogWriter commitLogWriter,
 	reverseIndex namespaceIndex,
 	needsBootstrap bool,
 	opts Options,
@@ -262,7 +259,6 @@ func newDatabaseShard(
 		namespaceReaderMgr: namespaceReaderMgr,
 		increasingIndex:    increasingIndex,
 		seriesPool:         opts.DatabaseSeriesPool(),
-		commitLogWriter:    commitLogWriter,
 		reverseIndex:       reverseIndex,
 		lookup:             newShardMap(shardMapOptions{}),
 		list:               list.New(),
@@ -753,7 +749,7 @@ func (s *dbShard) WriteTagged(
 	value float64,
 	unit xtime.Unit,
 	annotation []byte,
-) error {
+) (ts.Series, error) {
 	return s.writeAndIndex(ctx, id, tags, timestamp,
 		value, unit, annotation, true)
 }
@@ -765,7 +761,7 @@ func (s *dbShard) Write(
 	value float64,
 	unit xtime.Unit,
 	annotation []byte,
-) error {
+) (ts.Series, error) {
 	return s.writeAndIndex(ctx, id, ident.EmptyTagIterator, timestamp,
 		value, unit, annotation, false)
 }
@@ -779,11 +775,11 @@ func (s *dbShard) writeAndIndex(
 	unit xtime.Unit,
 	annotation []byte,
 	shouldReverseIndex bool,
-) error {
+) (ts.Series, error) {
 	// Prepare write
 	entry, opts, err := s.tryRetrieveWritableSeries(id)
 	if err != nil {
-		return err
+		return ts.Series{}, err
 	}
 
 	writable := entry != nil
@@ -799,7 +795,7 @@ func (s *dbShard) writeAndIndex(
 			},
 		})
 		if err != nil {
-			return err
+			return ts.Series{}, err
 		}
 
 		// Wait for the insert to be batched together and inserted
@@ -808,7 +804,7 @@ func (s *dbShard) writeAndIndex(
 		// Retrieve the inserted entry
 		entry, err = s.writableSeries(id, tags)
 		if err != nil {
-			return err
+			return ts.Series{}, err
 		}
 		writable = true
 
@@ -842,7 +838,7 @@ func (s *dbShard) writeAndIndex(
 		// release the reference we got on entry from `writableSeries`
 		entry.DecrementReaderWriterCount()
 		if err != nil {
-			return err
+			return ts.Series{}, err
 		}
 	} else {
 		// This is an asynchronous insert and write
@@ -861,7 +857,7 @@ func (s *dbShard) writeAndIndex(
 			},
 		})
 		if err != nil {
-			return err
+			return ts.Series{}, err
 		}
 		// NB(r): Make sure to use the copied ID which will eventually
 		// be set to the newly series inserted ID.
@@ -874,7 +870,7 @@ func (s *dbShard) writeAndIndex(
 	}
 
 	// Write commit log
-	series := commitlog.Series{
+	series := ts.Series{
 		UniqueIndex: commitLogSeriesUniqueIndex,
 		Namespace:   s.namespace.ID(),
 		ID:          commitLogSeriesID,
@@ -882,13 +878,7 @@ func (s *dbShard) writeAndIndex(
 		Shard:       s.shard,
 	}
 
-	datapoint := ts.Datapoint{
-		Timestamp: timestamp,
-		Value:     value,
-	}
-
-	return s.commitLogWriter.Write(ctx, series, datapoint,
-		unit, annotation)
+	return series, nil
 }
 
 func (s *dbShard) ReadEncoded(
@@ -910,9 +900,6 @@ func (s *dbShard) ReadEncoded(
 		switch s.opts.SeriesCachePolicy() {
 		case series.CacheAll:
 			// No-op, would be in memory if cached
-			return nil, nil
-		case series.CacheAllMetadata:
-			// No-op, would be in memory if metadata cached
 			return nil, nil
 		}
 	} else if err != nil {
@@ -1367,9 +1354,6 @@ func (s *dbShard) FetchBlocks(
 		case series.CacheAll:
 			// No-op, would be in memory if cached
 			return nil, nil
-		case series.CacheAllMetadata:
-			// No-op, would be in memory if metadata cached
-			return nil, nil
 		}
 	} else if err != nil {
 		return nil, err
@@ -1442,35 +1426,6 @@ func (s *dbShard) fetchActiveBlocksMetadata(
 	return res, nextIndexCursor, loopErr
 }
 
-func (s *dbShard) FetchBlocksMetadata(
-	ctx context.Context,
-	start, end time.Time,
-	limit int64,
-	pageToken int64,
-	opts block.FetchBlocksMetadataOptions,
-) (block.FetchBlocksMetadataResults, *int64, error) {
-	switch s.opts.SeriesCachePolicy() {
-	case series.CacheAll:
-	case series.CacheAllMetadata:
-	default:
-		// If not using CacheAll or CacheAllMetadata then calling the v1
-		// API will only return active block metadata (mutable and cached)
-		// hence this call is invalid
-		return nil, nil, fmt.Errorf(
-			"fetch blocks metadata v1 endpoint invalid with cache policy: %s",
-			s.opts.SeriesCachePolicy().String())
-	}
-
-	// For v1 endpoint we always include cached blocks because when using
-	// CacheAllMetadata the blocks will appear cached
-	seriesFetchBlocksMetadataOpts := series.FetchBlocksMetadataOptions{
-		FetchBlocksMetadataOptions: opts,
-		IncludeCachedBlocks:        true,
-	}
-	return s.fetchActiveBlocksMetadata(ctx, start, end,
-		limit, pageToken, seriesFetchBlocksMetadataOpts)
-}
-
 func (s *dbShard) FetchBlocksMetadataV2(
 	ctx context.Context,
 	start, end time.Time,
@@ -1489,7 +1444,7 @@ func (s *dbShard) FetchBlocksMetadataV2(
 	flushedPhase := token.FlushedSeriesPhase
 
 	cachePolicy := s.opts.SeriesCachePolicy()
-	if cachePolicy == series.CacheAll || cachePolicy == series.CacheAllMetadata {
+	if cachePolicy == series.CacheAll {
 		// If we are using a series cache policy that caches all block metadata
 		// in memory then we only ever perform the active phase as all metadata
 		// is actively held in memory
@@ -1497,8 +1452,7 @@ func (s *dbShard) FetchBlocksMetadataV2(
 		if activePhase != nil {
 			indexCursor = activePhase.IndexCursor
 		}
-		// We always include cached blocks because when using
-		// CacheAllMetadata the blocks will appear cached
+		// We always include cached blocks
 		seriesFetchBlocksMetadataOpts := series.FetchBlocksMetadataOptions{
 			FetchBlocksMetadataOptions: opts,
 			IncludeCachedBlocks:        true,
@@ -1746,9 +1700,9 @@ func (s *dbShard) Bootstrap(
 			// them for insertion.
 			// FOLLOWUP(r): Audit places that keep refs to the ID from a
 			// bootstrap result, newShardEntry copies it but some of the
-			// bootstrapped blocks when using all_metadata and perhaps
-			// another series cache policy keeps refs to the ID with
-			// retrieveID, so for now these IDs will be garbage collected)
+			// bootstrapped blocks when using certain series cache policies
+			// keeps refs to the ID with seriesID, so for now these IDs will
+			// be garbage collected)
 			dbBlocks.Tags.Finalize()
 		}
 

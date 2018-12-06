@@ -23,30 +23,33 @@ package promql
 import (
 	"fmt"
 
-	"github.com/m3db/m3/src/query/errors"
+	"github.com/m3db/m3/src/query/functions/scalar"
+	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/parser"
 
 	pql "github.com/prometheus/prometheus/promql"
 )
 
 type promParser struct {
-	expr pql.Expr
+	expr    pql.Expr
+	tagOpts models.TagOptions
 }
 
 // Parse takes a promQL string and converts parses it into a DAG
-func Parse(q string) (parser.Parser, error) {
+func Parse(q string, tagOpts models.TagOptions) (parser.Parser, error) {
 	expr, err := pql.ParseExpr(q)
 	if err != nil {
 		return nil, err
 	}
 
 	return &promParser{
-		expr: expr,
+		expr:    expr,
+		tagOpts: tagOpts,
 	}, nil
 }
 
 func (p *promParser) DAG() (parser.Nodes, parser.Edges, error) {
-	state := &parseState{}
+	state := &parseState{tagOpts: p.tagOpts}
 	err := state.walk(p.expr)
 	if err != nil {
 		return nil, nil, err
@@ -62,6 +65,7 @@ func (p *promParser) String() string {
 type parseState struct {
 	edges      parser.Edges
 	transforms parser.Nodes
+	tagOpts    models.TagOptions
 }
 
 func (p *parseState) lastTransformID() parser.NodeID {
@@ -103,7 +107,7 @@ func (p *parseState) walk(node pql.Node) error {
 		return nil
 
 	case *pql.MatrixSelector:
-		operation, err := NewSelectorFromMatrix(n)
+		operation, err := NewSelectorFromMatrix(n, p.tagOpts)
 		if err != nil {
 			return err
 		}
@@ -112,7 +116,7 @@ func (p *parseState) walk(node pql.Node) error {
 		return nil
 
 	case *pql.VectorSelector:
-		operation, err := NewSelectorFromVector(n)
+		operation, err := NewSelectorFromVector(n, p.tagOpts)
 		if err != nil {
 			return err
 		}
@@ -124,14 +128,18 @@ func (p *parseState) walk(node pql.Node) error {
 		expressions := n.Args
 		argTypes := n.Func.ArgTypes
 		argValues := make([]interface{}, 0, len(expressions))
-		for i, expr := range expressions {
-			if argTypes[i] == pql.ValueTypeScalar {
+		stringValues := make([]string, 0, len(expressions))
+		for i, argType := range argTypes {
+			expr := expressions[i]
+			if argType == pql.ValueTypeScalar {
 				val, err := resolveScalarArgument(expr)
 				if err != nil {
 					return err
 				}
 
 				argValues = append(argValues, val)
+			} else if argType == pql.ValueTypeString {
+				stringValues = append(stringValues, expr.(*pql.StringLiteral).Val)
 			} else {
 				if e, ok := expr.(*pql.MatrixSelector); ok {
 					argValues = append(argValues, e.Range)
@@ -141,19 +149,33 @@ func (p *parseState) walk(node pql.Node) error {
 					return err
 				}
 			}
-
 		}
 
-		op, err := NewFunctionExpr(n.Func.Name, argValues)
+		if n.Func.Variadic == -1 {
+			l := len(argTypes)
+			for _, expr := range expressions[l:] {
+				if argTypes[l-1] == pql.ValueTypeString {
+					stringValues = append(stringValues, expr.(*pql.StringLiteral).Val)
+				}
+			}
+		}
+
+		op, ok, err := NewFunctionExpr(n.Func.Name, argValues, stringValues)
 		if err != nil {
 			return err
 		}
 
+		if !ok {
+			return nil
+		}
+
 		opTransform := parser.NewTransformFromOperation(op, p.transformLen())
-		p.edges = append(p.edges, parser.Edge{
-			ParentID: p.lastTransformID(),
-			ChildID:  opTransform.ID,
-		})
+		if op.OpType() != scalar.TimeType {
+			p.edges = append(p.edges, parser.Edge{
+				ParentID: p.lastTransformID(),
+				ChildID:  opTransform.ID,
+			})
+		}
 		p.transforms = append(p.transforms, opTransform)
 		return nil
 
@@ -188,7 +210,11 @@ func (p *parseState) walk(node pql.Node) error {
 		return nil
 
 	case *pql.NumberLiteral:
-		op := NewScalarOperator(n)
+		op, err := NewScalarOperator(n)
+		if err != nil {
+			return err
+		}
+
 		opTransform := parser.NewTransformFromOperation(op, p.transformLen())
 		p.transforms = append(p.transforms, opTransform)
 		return nil
@@ -200,7 +226,4 @@ func (p *parseState) walk(node pql.Node) error {
 	default:
 		return fmt.Errorf("promql.Walk: unhandled node type %T, %v", node, node)
 	}
-
-	// TODO: This should go away once all cases have been implemented
-	return errors.ErrNotImplemented
 }

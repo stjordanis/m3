@@ -21,16 +21,17 @@
 package peers
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/m3db/m3/src/cluster/shard"
 	m3dbruntime "github.com/m3db/m3/src/dbnode/runtime"
 	"github.com/m3db/m3/src/dbnode/storage/bootstrap"
 	"github.com/m3db/m3/src/dbnode/storage/bootstrap/result"
 	"github.com/m3db/m3/src/dbnode/topology"
 	tu "github.com/m3db/m3/src/dbnode/topology/testutil"
-	"github.com/m3db/m3cluster/shard"
 	xtime "github.com/m3db/m3x/time"
 
 	"github.com/golang/mock/gomock"
@@ -71,6 +72,7 @@ func TestPeersSourceAvailableDataAndIndex(t *testing.T) {
 		bootstrapReadConsistency          topology.ReadConsistencyLevel
 		shardsTimeRangesToBootstrap       result.ShardTimeRanges
 		expectedAvailableShardsTimeRanges result.ShardTimeRanges
+		expectedErr                       error
 	}{
 		{
 			title: "Returns empty if only self is available",
@@ -91,6 +93,7 @@ func TestPeersSourceAvailableDataAndIndex(t *testing.T) {
 			bootstrapReadConsistency:          topology.ReadConsistencyLevelMajority,
 			shardsTimeRangesToBootstrap:       shardTimeRangesToBootstrap,
 			expectedAvailableShardsTimeRanges: result.ShardTimeRanges{},
+			expectedErr:                       errors.New("unknown shard state: Unknown"),
 		},
 		{
 			title: "Returns success if consistency can be met (available/leaving)",
@@ -149,14 +152,22 @@ func TestPeersSourceAvailableDataAndIndex(t *testing.T) {
 			src, err := newPeersSource(opts)
 			require.NoError(t, err)
 
-			var (
-				runOpts = testDefaultRunOpts.SetInitialTopologyState(tc.topoState)
-				dataRes = src.AvailableData(nsMetadata, tc.shardsTimeRangesToBootstrap, runOpts)
-			)
-			require.Equal(t, tc.expectedAvailableShardsTimeRanges, dataRes)
+			runOpts := testDefaultRunOpts.SetInitialTopologyState(tc.topoState)
+			dataRes, err := src.AvailableData(nsMetadata, tc.shardsTimeRangesToBootstrap, runOpts)
+			if tc.expectedErr != nil {
+				require.Equal(t, tc.expectedErr, err)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.expectedAvailableShardsTimeRanges, dataRes)
+			}
 
-			indexRes := src.AvailableIndex(nsMetadata, tc.shardsTimeRangesToBootstrap, runOpts)
-			require.Equal(t, tc.expectedAvailableShardsTimeRanges, indexRes)
+			indexRes, err := src.AvailableIndex(nsMetadata, tc.shardsTimeRangesToBootstrap, runOpts)
+			if tc.expectedErr != nil {
+				require.Equal(t, tc.expectedErr, err)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.expectedAvailableShardsTimeRanges, indexRes)
+			}
 		})
 	}
 }

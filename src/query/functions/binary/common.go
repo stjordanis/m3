@@ -21,6 +21,7 @@
 package binary
 
 import (
+	"bytes"
 	"errors"
 
 	"github.com/m3db/m3/src/query/block"
@@ -49,7 +50,7 @@ type VectorMatching struct {
 	Card VectorMatchCardinality
 	// MatchingLabels contains the labels which define equality of a pair of
 	// elements from the Vectors.
-	MatchingLabels []string
+	MatchingLabels [][]byte
 	// On includes the given label names from matching,
 	// rather than excluding them.
 	On bool
@@ -60,10 +61,11 @@ type VectorMatching struct {
 
 // HashFunc returns a function that calculates the signature for a metric
 // ignoring the provided labels. If on, then the given labels are only used instead.
-func HashFunc(on bool, names ...string) func(models.Tags) uint64 {
+func HashFunc(on bool, names ...[]byte) func(models.Tags) uint64 {
 	if on {
 		return func(tags models.Tags) uint64 { return tags.IDWithKeys(names...) }
 	}
+
 	return func(tags models.Tags) uint64 { return tags.IDWithExcludes(names...) }
 }
 
@@ -78,6 +80,15 @@ var (
 	errNoMatching              = errors.New("vector matching parameters must be provided for binary operations between series")
 )
 
+func tagMap(t models.Tags) map[string]models.Tag {
+	m := make(map[string]models.Tag, t.Len())
+	for _, tag := range t.Tags {
+		m[string(tag.Name)] = tag
+	}
+
+	return m
+}
+
 func combineMetaAndSeriesMeta(
 	meta, otherMeta block.Metadata,
 	seriesMeta, otherSeriesMeta []block.SeriesMeta,
@@ -91,36 +102,37 @@ func combineMetaAndSeriesMeta(
 
 	// NB (arnikola): mutating tags in `meta` to avoid allocations
 	leftTags := meta.Tags
-	otherTags := otherMeta.Tags.TagMap()
+	otherTags := tagMap(otherMeta.Tags)
 
-	metaTagsToAdd := make(models.Tags, 0, len(leftTags))
-	otherMetaTagsToAdd := make(models.Tags, 0, len(otherTags))
-	tags := models.EmptyTags()
+	metaTagsToAdd := models.NewTags(leftTags.Len(), leftTags.Opts)
+	otherMetaTagsToAdd := models.NewTags(len(otherTags), leftTags.Opts)
+	tags := models.NewTags(leftTags.Len(), leftTags.Opts)
 
-	for _, t := range leftTags {
-		if otherTag, ok := otherTags[t.Name]; ok {
-			if t.Value != otherTag.Value {
+	for _, t := range leftTags.Tags {
+		name := string(t.Name)
+		if otherTag, ok := otherTags[name]; ok {
+			if bytes.Equal(t.Value, otherTag.Value) {
+				tags = tags.AddTag(t)
+			} else {
 				// If both metas have the same common tag  with different
 				// values explicitly add it to each seriesMeta.
-				metaTagsToAdd = append(metaTagsToAdd, t)
-				otherMetaTagsToAdd = append(otherMetaTagsToAdd, otherTag)
-			} else {
-				tags = append(tags, t)
+				metaTagsToAdd = metaTagsToAdd.AddTag(t)
+				otherMetaTagsToAdd = otherMetaTagsToAdd.AddTag(otherTag)
 			}
 
 			// NB(arnikola): delete common tag from otherTags as it
 			// has already been handled
-			delete(otherTags, t.Name)
+			delete(otherTags, name)
 		} else {
 			// Tag does not exist on otherMeta explicitly add it to each seriesMeta
-			metaTagsToAdd = append(metaTagsToAdd, t)
+			metaTagsToAdd = metaTagsToAdd.AddTag(t)
 		}
 	}
 
 	// Iterate over otherMeta common tags and explicitly add
 	// remaining tags to otherSeriesMeta
 	for _, otherTag := range otherTags {
-		otherMetaTagsToAdd = append(otherMetaTagsToAdd, otherTag)
+		otherMetaTagsToAdd = otherMetaTagsToAdd.AddTag(otherTag)
 	}
 
 	// Set common tags

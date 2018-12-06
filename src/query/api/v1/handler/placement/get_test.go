@@ -22,28 +22,29 @@ package placement
 
 import (
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/m3db/m3/src/cluster/client"
+	"github.com/m3db/m3/src/cluster/generated/proto/placementpb"
+	"github.com/m3db/m3/src/cluster/kv/mem"
+	"github.com/m3db/m3/src/cluster/placement"
+	"github.com/m3db/m3/src/cluster/placement/service"
+	"github.com/m3db/m3/src/cluster/placement/storage"
+	"github.com/m3db/m3/src/cluster/services"
 	"github.com/m3db/m3/src/cmd/services/m3query/config"
 	"github.com/m3db/m3/src/query/util/logging"
-	"github.com/m3db/m3cluster/client"
-	"github.com/m3db/m3cluster/generated/proto/placementpb"
-	"github.com/m3db/m3cluster/placement"
-	"github.com/m3db/m3cluster/services"
 
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func SetupPlacementTest(t *testing.T) (*client.MockClient, *placement.MockService) {
+func SetupPlacementTest(t *testing.T, ctrl *gomock.Controller) (*client.MockClient, *placement.MockService) {
 	logging.InitWithCores(nil)
-
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
 
 	mockClient := client.NewMockClient(ctrl)
 	require.NotNil(t, mockClient)
@@ -60,57 +61,114 @@ func SetupPlacementTest(t *testing.T) (*client.MockClient, *placement.MockServic
 	return mockClient, mockPlacementService
 }
 
-func TestPlacementGetHandler(t *testing.T) {
-	mockClient, mockPlacementService := SetupPlacementTest(t)
-	handler := NewGetHandler(mockClient, config.Configuration{})
+func setupPlacementTest(t *testing.T, ctrl *gomock.Controller, initPlacement placement.Placement) *client.MockClient {
+	logging.InitWithCores(nil)
 
-	// Test successful get
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/placement/get", nil)
-	require.NotNil(t, req)
+	mockClient := client.NewMockClient(ctrl)
+	require.NotNil(t, mockClient)
 
-	placementProto := &placementpb.Placement{
-		Instances: map[string]*placementpb.Instance{
-			"host1": &placementpb.Instance{
-				Id:             "host1",
-				IsolationGroup: "rack1",
-				Zone:           "test",
-				Weight:         1,
-				Endpoint:       "http://host1:1234",
-				Hostname:       "host1",
-				Port:           1234,
-			},
-			"host2": &placementpb.Instance{
-				Id:             "host2",
-				IsolationGroup: "rack1",
-				Zone:           "test",
-				Weight:         1,
-				Endpoint:       "http://host2:1234",
-				Hostname:       "host2",
-				Port:           1234,
-			},
+	mockServices := services.NewMockServices(ctrl)
+	require.NotNil(t, mockServices)
+
+	mockClient.EXPECT().Services(gomock.Any()).Return(mockServices, nil).AnyTimes()
+	mockServices.EXPECT().PlacementService(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ interface{}, opts placement.Options) (placement.Service, error) {
+			ps := service.NewPlacementService(storage.NewPlacementStorage(mem.NewStore(), "", opts), opts)
+			if initPlacement != nil {
+				_, err := ps.Set(initPlacement)
+				require.NoError(t, err)
+			}
+			return ps, nil
 		},
-	}
+	).AnyTimes()
 
-	placementObj, err := placement.NewPlacementFromProto(placementProto)
-	require.NoError(t, err)
+	return mockClient
+}
 
-	mockPlacementService.EXPECT().Placement().Return(placementObj, 0, nil)
-	handler.ServeHTTP(w, req)
+func TestPlacementGetHandler(t *testing.T) {
+	runForAllAllowedServices(func(serviceName string) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
 
-	resp := w.Result()
-	body, _ := ioutil.ReadAll(resp.Body)
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Equal(t, "{\"placement\":{\"instances\":{\"host1\":{\"id\":\"host1\",\"isolationGroup\":\"rack1\",\"zone\":\"test\",\"weight\":1,\"endpoint\":\"http://host1:1234\",\"shards\":[],\"shardSetId\":0,\"hostname\":\"host1\",\"port\":1234},\"host2\":{\"id\":\"host2\",\"isolationGroup\":\"rack1\",\"zone\":\"test\",\"weight\":1,\"endpoint\":\"http://host2:1234\",\"shards\":[],\"shardSetId\":0,\"hostname\":\"host2\",\"port\":1234}},\"replicaFactor\":0,\"numShards\":0,\"isSharded\":false,\"cutoverTime\":\"0\",\"isMirrored\":false,\"maxShardSetId\":0},\"version\":0}", string(body))
+		var (
+			mockClient, mockPlacementService = SetupPlacementTest(t, ctrl)
+			handlerOpts                      = NewHandlerOptions(
+				mockClient, config.Configuration{}, nil)
+			handler = NewGetHandler(handlerOpts)
+		)
 
-	// Test error case
-	w = httptest.NewRecorder()
-	req = httptest.NewRequest("GET", "/placement/get", nil)
-	require.NotNil(t, req)
+		// Test successful get
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(GetHTTPMethod, M3DBGetURL, nil)
+		require.NotNil(t, req)
 
-	mockPlacementService.EXPECT().Placement().Return(nil, 0, errors.New("key not found"))
-	handler.ServeHTTP(w, req)
+		placementProto := &placementpb.Placement{
+			Instances: map[string]*placementpb.Instance{
+				"host1": &placementpb.Instance{
+					Id:             "host1",
+					IsolationGroup: "rack1",
+					Zone:           "test",
+					Weight:         1,
+					Endpoint:       "http://host1:1234",
+					Hostname:       "host1",
+					Port:           1234,
+				},
+				"host2": &placementpb.Instance{
+					Id:             "host2",
+					IsolationGroup: "rack1",
+					Zone:           "test",
+					Weight:         1,
+					Endpoint:       "http://host2:1234",
+					Hostname:       "host2",
+					Port:           1234,
+				},
+			},
+		}
 
-	resp = w.Result()
-	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+		const placementJSON = `{"placement":{"instances":{"host1":{"id":"host1","isolationGroup":"rack1","zone":"test","weight":1,"endpoint":"http://host1:1234","shards":[],"shardSetId":0,"hostname":"host1","port":1234},"host2":{"id":"host2","isolationGroup":"rack1","zone":"test","weight":1,"endpoint":"http://host2:1234","shards":[],"shardSetId":0,"hostname":"host2","port":1234}},"replicaFactor":0,"numShards":0,"isSharded":false,"cutoverTime":"0","isMirrored":false,"maxShardSetId":0},"version":%d}`
+
+		placementObj, err := placement.NewPlacementFromProto(placementProto)
+		require.NoError(t, err)
+
+		mockPlacementService.EXPECT().Placement().Return(placementObj, nil)
+		handler.ServeHTTP(serviceName, w, req)
+
+		resp := w.Result()
+		body, _ := ioutil.ReadAll(resp.Body)
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, fmt.Sprintf(placementJSON, 0), string(body))
+
+		// Test error case
+		w = httptest.NewRecorder()
+		req = httptest.NewRequest(GetHTTPMethod, M3DBGetURL, nil)
+		require.NotNil(t, req)
+
+		mockPlacementService.EXPECT().Placement().Return(nil, errors.New("key not found"))
+		handler.ServeHTTP(serviceName, w, req)
+
+		resp = w.Result()
+		assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+
+		// With bad version request
+		w = httptest.NewRecorder()
+		req = httptest.NewRequest(GetHTTPMethod, "/placement/get?version=foo", nil)
+		require.NotNil(t, req)
+
+		handler.ServeHTTP(serviceName, w, req)
+		resp = w.Result()
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+		// With valid version request
+		w = httptest.NewRecorder()
+		req = httptest.NewRequest(GetHTTPMethod, "/placement/get?version=12", nil)
+		require.NotNil(t, req)
+
+		mockPlacementService.EXPECT().PlacementForVersion(12).Return(placementObj.Clone().SetVersion(12), nil)
+
+		handler.ServeHTTP(serviceName, w, req)
+		resp = w.Result()
+		body, _ = ioutil.ReadAll(resp.Body)
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, fmt.Sprintf(placementJSON, 12), string(body))
+	})
 }

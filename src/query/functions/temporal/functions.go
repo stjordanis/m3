@@ -23,8 +23,10 @@ package temporal
 import (
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/m3db/m3/src/query/executor/transform"
+	"github.com/m3db/m3/src/query/ts"
 )
 
 const (
@@ -38,31 +40,39 @@ const (
 	ChangesType = "changes"
 )
 
-// NewFunctionOp creates a new base temporal transform for functions
-func NewFunctionOp(args []interface{}, optype string) (transform.Params, error) {
-	if optype != ResetsType && optype != ChangesType {
-		return nil, fmt.Errorf("unknown function type: %s", optype)
-	}
+type comparisonFunc func(a, b float64) bool
 
-	return newBaseOp(args, optype, newFunctionNode, nil)
+type functionProcessor struct {
+	compFunc comparisonFunc
 }
 
-func newFunctionNode(op baseOp, controller *transform.Controller, _ transform.Options) Processor {
-	var compFunc comparisonFunc
-	if op.operatorType == ResetsType {
-		compFunc = func(a, b float64) bool { return a < b }
-	} else {
-		compFunc = func(a, b float64) bool { return a != b }
-	}
-
+func (f functionProcessor) Init(op baseOp, controller *transform.Controller, opts transform.Options) Processor {
 	return &functionNode{
 		op:             op,
 		controller:     controller,
-		comparisonFunc: compFunc,
+		comparisonFunc: f.compFunc,
 	}
 }
 
-type comparisonFunc func(a, b float64) bool
+// NewFunctionOp creates a new base temporal transform for functions
+func NewFunctionOp(args []interface{}, optype string) (transform.Params, error) {
+	var compFunc comparisonFunc
+
+	switch optype {
+	case ResetsType:
+		compFunc = func(a, b float64) bool { return a < b }
+	case ChangesType:
+		compFunc = func(a, b float64) bool { return a != b }
+	default:
+		return nil, fmt.Errorf("unknown function type: %s", optype)
+	}
+
+	f := functionProcessor{
+		compFunc: compFunc,
+	}
+
+	return newBaseOp(args, optype, f)
+}
 
 type functionNode struct {
 	op             baseOp
@@ -70,28 +80,28 @@ type functionNode struct {
 	comparisonFunc comparisonFunc
 }
 
-func (f *functionNode) Process(values []float64) float64 {
-	if len(values) == 0 {
+func (f *functionNode) Process(datapoints ts.Datapoints, _ time.Time) float64 {
+	if len(datapoints) == 0 {
 		return math.NaN()
 	}
 
 	allNaNs := true
 	result := 0.0
-	prev := values[0]
+	prev := datapoints[0].Value
 
-	for _, curr := range values[1:] {
-		if math.IsNaN(curr) {
+	for _, curr := range datapoints[1:] {
+		if math.IsNaN(curr.Value) {
 			continue
 		}
 
 		allNaNs = false
 		if !math.IsNaN(prev) {
-			if f.comparisonFunc(curr, prev) {
+			if f.comparisonFunc(curr.Value, prev) {
 				result++
 			}
 		}
 
-		prev = curr
+		prev = curr.Value
 	}
 
 	if allNaNs {

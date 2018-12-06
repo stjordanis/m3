@@ -47,10 +47,12 @@ import (
 	"google.golang.org/grpc"
 )
 
+var queryPort = 25123
+
 var configYAML = `
 listenAddress:
   type: "config"
-  value: "127.0.0.1:7201"
+  value: "127.0.0.1:25123"
 
 metrics:
   scope:
@@ -66,8 +68,24 @@ clusters:
       - namespace: prometheus_metrics
         type: unaggregated
         retention: 48h
+
+tagOptions:
+  metricName: "_new"
+
+readWorkerPoolPolicy:
+  grow: true
+  size: 100
+  shards: 1000
+  killProbability: 0.3
+
+writeWorkerPoolPolicy:
+  grow: true
+  size: 100
+  shards: 1000
+  killProbability: 0.3
 `
 
+//TODO: Use randomly assigned port here
 func TestRun(t *testing.T) {
 	ctrl := gomock.NewController(xtest.Reporter{T: t})
 	defer ctrl.Finish()
@@ -85,7 +103,7 @@ func TestRun(t *testing.T) {
 	session := client.NewMockSession(ctrl)
 	for _, value := range []float64{1, 2} {
 		session.EXPECT().WriteTagged(ident.NewIDMatcher("prometheus_metrics"),
-			ident.NewIDMatcher("__name__=first,biz=baz,foo=bar,"),
+			ident.NewIDMatcher("_new=first,biz=baz,foo=bar,"),
 			gomock.Any(),
 			gomock.Any(),
 			value,
@@ -94,7 +112,7 @@ func TestRun(t *testing.T) {
 	}
 	for _, value := range []float64{3, 4} {
 		session.EXPECT().WriteTagged(ident.NewIDMatcher("prometheus_metrics"),
-			ident.NewIDMatcher("__name__=second,bar=baz,foo=qux,"),
+			ident.NewIDMatcher("_new=second,bar=baz,foo=qux,"),
 			gomock.Any(),
 			gomock.Any(),
 			value,
@@ -126,13 +144,13 @@ func TestRun(t *testing.T) {
 	}()
 
 	// Wait for server to come up
-	waitForServerHealthy(t, 7201)
+	waitForServerHealthy(t, queryPort)
 
 	// Send Prometheus write request
 	promReq := test.GeneratePromWriteRequest()
 	promReqBody := test.GeneratePromWriteRequestBody(t, promReq)
 	req, err := http.NewRequest(http.MethodPost,
-		"http://127.0.0.1:7201"+remote.PromWriteURL, promReqBody)
+		fmt.Sprintf("http://127.0.0.1:%d", queryPort)+remote.PromWriteURL, promReqBody)
 	require.NoError(t, err)
 
 	res, err := http.DefaultClient.Do(req)
@@ -176,8 +194,8 @@ func waitForServerHealthy(t *testing.T, port int) {
 }
 
 type queryServer struct {
-	reads int
-	mu    sync.Mutex
+	reads, searches, tagCompletes int
+	mu                            sync.Mutex
 }
 
 func (s *queryServer) Fetch(
@@ -187,6 +205,26 @@ func (s *queryServer) Fetch(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.reads++
+	return nil
+}
+
+func (s *queryServer) Search(
+	*rpc.SearchRequest,
+	rpc.Query_SearchServer,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.searches++
+	return nil
+}
+
+func (s *queryServer) CompleteTags(
+	*rpc.CompleteTagsRequest,
+	rpc.Query_CompleteTagsServer,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tagCompletes++
 	return nil
 }
 
@@ -211,6 +249,21 @@ rpc:
     - "127.0.0.1:17202"
 
 backend: grpc
+
+tagOptions:
+  metricName: "bar"
+
+readWorkerPoolPolicy:
+  grow: true
+  size: 100
+  shards: 1000
+  killProbability: 0.3
+
+writeWorkerPoolPolicy:
+  grow: true
+  size: 100
+  shards: 1000
+  killProbability: 0.3
 `
 
 	ctrl := gomock.NewController(xtest.Reporter{T: t})

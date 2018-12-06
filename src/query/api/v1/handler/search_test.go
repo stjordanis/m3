@@ -34,6 +34,7 @@ import (
 	"github.com/m3db/m3/src/dbnode/client"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/storage"
+	"github.com/m3db/m3/src/query/test"
 	"github.com/m3db/m3/src/query/test/m3"
 	"github.com/m3db/m3/src/query/test/seriesiter"
 	"github.com/m3db/m3/src/query/util/logging"
@@ -52,13 +53,13 @@ func generateSearchReq() *storage.FetchQuery {
 	matchers := models.Matchers{
 		{
 			Type:  models.MatchEqual,
-			Name:  "foo",
-			Value: "bar",
+			Name:  []byte("foo"),
+			Value: []byte("bar"),
 		},
 		{
 			Type:  models.MatchEqual,
-			Name:  "biz",
-			Value: "baz",
+			Name:  []byte("biz"),
+			Value: []byte("baz"),
 		},
 	}
 	return &storage.FetchQuery{
@@ -110,7 +111,8 @@ func TestSearchResponse(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, testID, results.Metrics[0].ID)
-	assert.Equal(t, models.Tags{{Name: "foo", Value: "bar"}}, results.Metrics[0].Tags)
+	expected := test.TagSliceToTags([]models.Tag{{Name: []byte("foo"), Value: []byte("bar")}})
+	assert.Equal(t, expected.Tags, results.Metrics[0].Tags.Tags)
 }
 
 func TestSearchEndpoint(t *testing.T) {

@@ -92,9 +92,57 @@ var testRateCases = []testRateCase{
 			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
 		},
 	},
+	{
+		name:   "rate",
+		opType: RateType,
+		vals: [][]float64{
+			{61108224, 61943808, 61943808, 61943808, 62205952},
+			{1987036, 1988988, 1990940, 1992892, 1994844},
+		},
+		afterBlockOne: [][]float64{
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), 1165.0844},
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), 32.5333},
+		},
+		afterAllBlocks: [][]float64{
+			{255709.8666, 259191.4666, 259191.4666, 258099.2, 4573.8666},
+			{8303.7166, 8303.7166, 8303.7166, 8303.7166, 32.5333},
+		},
+	},
+	{
+		name:   "rate with some NaNs",
+		opType: RateType,
+		vals: [][]float64{
+			{61108224, 61943808, 61943808, 62205952, math.NaN()},
+			{1987036, 1988988, 1990940, math.NaN(), 1994844},
+		},
+		afterBlockOne: [][]float64{
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), 1310.72},
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), 32.5333},
+		},
+		afterAllBlocks: [][]float64{
+			{255709.8666, 259191.4666, 258099.2, 4878.7911, 4878.7911},
+			{8303.7166, 8303.7166, 8848.6222, 8848.6222, 32.5333},
+		},
+	},
+	{
+		name:   "rate with all NaNs",
+		opType: RateType,
+		vals: [][]float64{
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+		},
+		afterBlockOne: [][]float64{
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+		},
+		afterAllBlocks: [][]float64{
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+		},
+	},
 }
 
-func TestIRate(t *testing.T) {
+func TestRate(t *testing.T) {
 	testRate(t, testRateCases)
 }
 
@@ -147,10 +195,113 @@ var testDeltaCases = []testRateCase{
 			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
 		},
 	},
+	{
+		name:   "delta",
+		opType: DeltaType,
+		vals: [][]float64{
+			{678758, 680986, 683214, 685442, 687670},
+			{2299, 2299, 2299, 2787, 2787},
+		},
+		afterBlockOne: [][]float64{
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), 8912},
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), 610},
+		},
+		afterAllBlocks: [][]float64{
+			{-2785, -2785, -2785, -2785, 11140},
+			{0, 0, -610, 0, 610},
+		},
+	},
+	{
+		name:   "delta with some NaNs",
+		opType: DeltaType,
+		vals: [][]float64{
+			{678758, 680986, 683214, 685442, math.NaN()},
+			{2299, 2299, 2299, math.NaN(), 2787},
+		},
+		afterBlockOne: [][]float64{
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), 6684},
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), 610},
+		},
+		afterAllBlocks: [][]float64{
+			{-2785, -2785, -2785, 8912, 8912},
+			{0, 0, -650.6666, -650.6666, 610},
+		},
+	},
+	{
+		name:   "delta with all NaNs",
+		opType: DeltaType,
+		vals: [][]float64{
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+		},
+		afterBlockOne: [][]float64{
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+		},
+		afterAllBlocks: [][]float64{
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+		},
+	},
 }
 
-func TestIDelta(t *testing.T) {
+func TestDelta(t *testing.T) {
 	testRate(t, testDeltaCases)
+}
+
+var testIncreaseCases = []testRateCase{
+	{
+		name:   "increase",
+		opType: IncreaseType,
+		vals: [][]float64{
+			{872594, 865910, 868138, 870366, 872594},
+			{1987036, 1988988, 1990940, 1992892, 1994844},
+		},
+		afterBlockOne: [][]float64{
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), 8912},
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), 9760},
+		},
+		afterAllBlocks: [][]float64{
+			{8355, 1087957.5, 1087957.5, 1087957.5, 1090742.5},
+			{2491115, 2491115, 2491115, 2491115, 9760},
+		},
+	},
+	{
+		name:   "increase with some NaNs",
+		opType: IncreaseType,
+		vals: [][]float64{
+			{872594, 865910, 868138, 872694, math.NaN()},
+			{1987036, 1988988, 1990940, math.NaN(), 1994844},
+		},
+		afterBlockOne: [][]float64{
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), 10176},
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), 9760},
+		},
+		afterAllBlocks: [][]float64{
+			{1099222.5, 2178825, 2175915, 1163592, 1163592},
+			{2491115, 2491115, 2654586.6666, 2654586.6666, 9760},
+		},
+	},
+	{
+		name:   "increase with all NaNs",
+		opType: IncreaseType,
+		vals: [][]float64{
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+		},
+		afterBlockOne: [][]float64{
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+		},
+		afterAllBlocks: [][]float64{
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+			{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()},
+		},
+	},
+}
+
+func TestIncrease(t *testing.T) {
+	testRate(t, testIncreaseCases)
 }
 
 // B1 has NaN in first series, first position
@@ -159,7 +310,7 @@ func testRate(t *testing.T, testCases []testRateCase) {
 		t.Run(tt.name, func(t *testing.T) {
 			values, bounds := test.GenerateValuesAndBounds(tt.vals, nil)
 			boundStart := bounds.Start
-			block3 := test.NewBlockFromValues(bounds, values)
+			block3 := test.NewUnconsolidatedBlockFromDatapoints(bounds, values)
 			c, sink := executor.NewControllerWithSink(parser.NodeID(1))
 
 			baseOp, err := NewRateOp([]interface{}{5 * time.Minute}, tt.opType)
@@ -182,7 +333,7 @@ func testRate(t *testing.T, testCases []testRateCase) {
 
 			original := values[0][0]
 			values[0][0] = math.NaN()
-			block1 := test.NewBlockFromValues(models.Bounds{
+			block1 := test.NewUnconsolidatedBlockFromDatapoints(models.Bounds{
 				Start:    bounds.Start.Add(-2 * bounds.Duration),
 				Duration: bounds.Duration,
 				StepSize: bounds.StepSize,
@@ -199,7 +350,7 @@ func testRate(t *testing.T, testCases []testRateCase) {
 			_, exists = bNode.cache.get(boundStart.Add(-1 * bounds.Duration))
 			assert.False(t, exists, "block cached")
 
-			block2 := test.NewBlockFromValues(models.Bounds{
+			block2 := test.NewUnconsolidatedBlockFromDatapoints(models.Bounds{
 				Start:    bounds.Start.Add(-1 * bounds.Duration),
 				Duration: bounds.Duration,
 				StepSize: bounds.StepSize,

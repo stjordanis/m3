@@ -21,6 +21,8 @@
 package utils
 
 import (
+	"bytes"
+
 	"github.com/m3db/m3/src/query/block"
 	"github.com/m3db/m3/src/query/models"
 )
@@ -45,16 +47,16 @@ func DedupeMetadata(
 		return models.EmptyTags(), seriesMeta
 	}
 
-	commonKeys := make([]string, 0, len(seriesMeta[0].Tags))
-	commonTags := make(map[string]string, len(seriesMeta[0].Tags))
+	commonKeys := make([][]byte, 0, seriesMeta[0].Tags.Len())
+	commonTags := make(map[string][]byte, seriesMeta[0].Tags.Len())
 	// For each tag in the first series, read through list of seriesMetas;
 	// if key not found or value differs, this is not a shared tag
 	var distinct bool
-	for _, t := range seriesMeta[0].Tags {
+	for _, t := range seriesMeta[0].Tags.Tags {
 		distinct = false
 		for _, metas := range seriesMeta[1:] {
 			if val, ok := metas.Tags.Get(t.Name); ok {
-				if val != t.Value {
+				if !bytes.Equal(val, t.Value) {
 					distinct = true
 					break
 				}
@@ -67,7 +69,7 @@ func DedupeMetadata(
 		if !distinct {
 			// This is a shared tag; add it to shared meta
 			commonKeys = append(commonKeys, t.Name)
-			commonTags[t.Name] = t.Value
+			commonTags[string(t.Name)] = t.Value
 		}
 	}
 
@@ -75,5 +77,10 @@ func DedupeMetadata(
 		seriesMeta[i].Tags = meta.Tags.TagsWithoutKeys(commonKeys)
 	}
 
-	return models.FromMap(commonTags), seriesMeta
+	tags := models.NewTags(len(commonTags), seriesMeta[0].Tags.Opts)
+	for n, v := range commonTags {
+		tags = tags.AddTag(models.Tag{Name: []byte(n), Value: v})
+	}
+
+	return tags, seriesMeta
 }

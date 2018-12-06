@@ -29,6 +29,7 @@ import (
 	"github.com/m3db/m3/src/dbnode/integration/generate"
 	persistfs "github.com/m3db/m3/src/dbnode/persist/fs"
 	"github.com/m3db/m3/src/dbnode/retention"
+	"github.com/m3db/m3/src/dbnode/runtime"
 	"github.com/m3db/m3/src/dbnode/storage/bootstrap"
 	"github.com/m3db/m3/src/dbnode/storage/bootstrap/bootstrapper"
 	bcl "github.com/m3db/m3/src/dbnode/storage/bootstrap/bootstrapper/commitlog"
@@ -124,7 +125,8 @@ func TestCommitLogAndFSMergeBootstrap(t *testing.T) {
 	bsOpts := newDefaulTestResultOptions(setup.storageOpts)
 	bclOpts := bcl.NewOptions().
 		SetResultOptions(bsOpts).
-		SetCommitLogOptions(commitLogOpts)
+		SetCommitLogOptions(commitLogOpts).
+		SetRuntimeOptionsManager(runtime.NewOptionsManager())
 	fsOpts := setup.storageOpts.CommitLogOptions().FilesystemOptions()
 
 	commitLogBootstrapper, err := bcl.NewCommitLogBootstrapperProvider(
@@ -141,9 +143,9 @@ func TestCommitLogAndFSMergeBootstrap(t *testing.T) {
 	fsBootstrapper, err := fs.NewFileSystemBootstrapperProvider(bfsOpts, commitLogBootstrapper)
 	require.NoError(t, err)
 	// bootstrapper storage opts
-	processOpts := bootstrap.NewProcessOptions().SetAdminClient(
-		setup.m3dbAdminClient,
-	)
+	processOpts := bootstrap.NewProcessOptions().
+		SetTopologyMapProvider(setup).
+		SetOrigin(setup.origin)
 	process, err := bootstrap.NewProcessProvider(
 		fsBootstrapper, processOpts, bsOpts)
 	require.NoError(t, err)

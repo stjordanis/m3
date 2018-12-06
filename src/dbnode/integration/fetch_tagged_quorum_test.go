@@ -26,14 +26,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/m3db/m3/src/cluster/services"
+	"github.com/m3db/m3/src/cluster/shard"
 	"github.com/m3db/m3/src/dbnode/client"
 	"github.com/m3db/m3/src/dbnode/encoding"
 	"github.com/m3db/m3/src/dbnode/storage/index"
 	"github.com/m3db/m3/src/dbnode/storage/namespace"
 	"github.com/m3db/m3/src/dbnode/topology"
 	"github.com/m3db/m3/src/m3ninx/idx"
-	"github.com/m3db/m3cluster/services"
-	"github.com/m3db/m3cluster/shard"
 	"github.com/m3db/m3x/context"
 	"github.com/m3db/m3x/ident"
 	xtime "github.com/m3db/m3x/time"
@@ -234,15 +234,16 @@ func makeMultiNodeSetup(
 	asyncInserts bool,
 	instances []services.ServiceInstance,
 ) (testSetups, closeFn, client.Options) {
-
-	nsOpts := namespace.NewOptions()
-	md, err := namespace.NewMetadata(testNamespaces[0],
-		nsOpts.SetRetentionOptions(nsOpts.RetentionOptions().SetRetentionPeriod(6*time.Hour)).
-			SetIndexOptions(namespace.NewIndexOptions().SetEnabled(indexingEnabled)))
+	var (
+		nsOpts  = namespace.NewOptions()
+		md, err = namespace.NewMetadata(testNamespaces[0],
+			nsOpts.SetRetentionOptions(nsOpts.RetentionOptions().SetRetentionPeriod(6*time.Hour)).
+				SetIndexOptions(namespace.NewIndexOptions().SetEnabled(indexingEnabled)))
+	)
 	require.NoError(t, err)
 
 	nspaces := []namespace.Metadata{md}
-	nodes, topoInit, closeFn := newNodes(t, instances, nspaces, asyncInserts)
+	nodes, topoInit, closeFn := newNodes(t, numShards, instances, nspaces, asyncInserts)
 	for _, node := range nodes {
 		node.opts = node.opts.SetNumShards(numShards)
 	}

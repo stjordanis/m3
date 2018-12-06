@@ -22,59 +22,94 @@ package placement
 
 import (
 	"net/http"
+	"path"
+	"strconv"
+	"time"
 
-	"github.com/m3db/m3/src/cmd/services/m3query/config"
+	"github.com/m3db/m3/src/cluster/placement"
 	"github.com/m3db/m3/src/query/api/v1/handler"
 	"github.com/m3db/m3/src/query/generated/proto/admin"
 	"github.com/m3db/m3/src/query/util/logging"
-	clusterclient "github.com/m3db/m3cluster/client"
+	"github.com/m3db/m3/src/x/net/http"
 
 	"go.uber.org/zap"
 )
 
 const (
-	// GetURL is the url for the placement get handler (with the GET method).
-	GetURL = handler.RoutePrefixV1 + "/placement"
-
 	// GetHTTPMethod is the HTTP method used with this resource.
 	GetHTTPMethod = http.MethodGet
+)
+
+var (
+	// DeprecatedM3DBGetURL is the old url for the placement get handler, maintained for
+	// backwards compatibility.
+	DeprecatedM3DBGetURL = path.Join(handler.RoutePrefixV1, PlacementPathName)
+
+	// M3DBGetURL is the url for the placement get handler (with the GET method)
+	// for the M3DB service.
+	M3DBGetURL = path.Join(handler.RoutePrefixV1, M3DBServicePlacementPathName)
+
+	// M3AggGetURL is the url for the placement get handler (with the GET method)
+	// for the M3Agg service.
+	M3AggGetURL = path.Join(handler.RoutePrefixV1, M3AggServicePlacementPathName)
+
+	// M3CoordinatorGetURL is the url for the placement get handler (with the GET method)
+	// for the M3Coordinator service.
+	M3CoordinatorGetURL = path.Join(handler.RoutePrefixV1, M3CoordinatorServicePlacementPathName)
 )
 
 // GetHandler is the handler for placement gets.
 type GetHandler Handler
 
 // NewGetHandler returns a new instance of GetHandler.
-func NewGetHandler(client clusterclient.Client, cfg config.Configuration) *GetHandler {
-	return &GetHandler{client: client, cfg: cfg}
+func NewGetHandler(opts HandlerOptions) *GetHandler {
+	return &GetHandler{HandlerOptions: opts, nowFn: time.Now}
 }
 
-func (h *GetHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	logger := logging.WithContext(ctx)
+func (h *GetHandler) ServeHTTP(serviceName string, w http.ResponseWriter, r *http.Request) {
+	var (
+		ctx    = r.Context()
+		logger = logging.WithContext(ctx)
+		opts   = NewServiceOptions(
+			serviceName, r.Header, h.M3AggServiceOptions)
+	)
 
-	service, err := Service(h.client, r.Header)
+	service, err := Service(h.ClusterClient, opts, h.nowFn(), nil)
 	if err != nil {
-		handler.Error(w, err, http.StatusInternalServerError)
+		xhttp.Error(w, err, http.StatusInternalServerError)
 		return
 	}
 
-	placement, version, err := service.Placement()
+	var placement placement.Placement
+	var version int
+	status := http.StatusNotFound
+	if vs := r.FormValue("version"); vs != "" {
+		version, err = strconv.Atoi(vs)
+		if err == nil {
+			placement, err = service.PlacementForVersion(version)
+		} else {
+			status = http.StatusBadRequest
+		}
+	} else {
+		placement, err = service.Placement()
+	}
+
 	if err != nil {
-		handler.Error(w, err, http.StatusNotFound)
+		xhttp.Error(w, err, status)
 		return
 	}
 
 	placementProto, err := placement.Proto()
 	if err != nil {
 		logger.Error("unable to get placement protobuf", zap.Any("error", err))
-		handler.Error(w, err, http.StatusInternalServerError)
+		xhttp.Error(w, err, http.StatusInternalServerError)
 		return
 	}
 
 	resp := &admin.PlacementGetResponse{
 		Placement: placementProto,
-		Version:   int32(version),
+		Version:   int32(placement.Version()),
 	}
 
-	handler.WriteProtoMsgJSONResponse(w, resp, logger)
+	xhttp.WriteProtoMsgJSONResponse(w, resp, logger)
 }

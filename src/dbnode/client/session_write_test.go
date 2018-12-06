@@ -32,8 +32,10 @@ import (
 	"github.com/m3db/m3/src/dbnode/generated/thrift/rpc"
 	"github.com/m3db/m3/src/dbnode/topology"
 	xmetrics "github.com/m3db/m3/src/dbnode/x/metrics"
+	xtest "github.com/m3db/m3/src/x/test"
 	xerrors "github.com/m3db/m3x/errors"
 	"github.com/m3db/m3x/ident"
+	"github.com/m3db/m3x/instrument"
 	xretry "github.com/m3db/m3x/retry"
 	xtime "github.com/m3db/m3x/time"
 
@@ -101,6 +103,49 @@ func TestSessionWrite(t *testing.T) {
 	assert.NoError(t, session.Close())
 }
 
+func TestSessionWriteDoesNotCloneNoFinalize(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	session := newDefaultTestSession(t).(*session)
+	w := newWriteStub()
+	var completionFn completionFn
+	enqueueWg := mockHostQueues(ctrl, session, sessionTestReplicas, []testEnqueueFn{func(idx int, op op) {
+		completionFn = op.CompletionFn()
+		write, ok := op.(*writeOperation)
+		require.True(t, ok)
+		require.True(t,
+			xtest.ByteSlicesBackedBySameData(
+				w.ns.Bytes(),
+				write.namespace.Bytes()))
+		require.True(t,
+			xtest.ByteSlicesBackedBySameData(
+				w.id.Bytes(),
+				write.request.ID))
+	}})
+
+	require.NoError(t, session.Open())
+
+	// Begin write
+	var resultErr error
+	var writeWg sync.WaitGroup
+	writeWg.Add(1)
+	go func() {
+		resultErr = session.Write(w.ns, w.id, w.t, w.value, w.unit, w.annotation)
+		writeWg.Done()
+	}()
+
+	// Callback
+	enqueueWg.Wait()
+	for i := 0; i < session.state.topoMap.Replicas(); i++ {
+		completionFn(session.state.topoMap.Hosts()[0], nil)
+	}
+
+	writeWg.Wait()
+	require.NoError(t, resultErr)
+	require.NoError(t, session.Close())
+}
+
 func TestSessionWriteBadUnitErr(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -136,7 +181,10 @@ func TestSessionWriteBadRequestErrorIsNonRetryable(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	session := newDefaultTestSession(t).(*session)
+	scope := tally.NewTestScope("", nil)
+	opts := newSessionTestOptions().
+		SetInstrumentOptions(instrument.NewOptions().SetMetricsScope(scope))
+	session := newTestSession(t, opts).(*session)
 
 	w := struct {
 		ns         ident.ID
@@ -177,6 +225,12 @@ func TestSessionWriteBadRequestErrorIsNonRetryable(t *testing.T) {
 	assert.Error(t, err)
 	assert.True(t, xerrors.IsNonRetryableError(err))
 
+	// Assert counting bad request errors by number of nodes
+	counters := scope.Snapshot().Counters()
+	nodesBadRequestErrors, ok := counters["write.nodes-responding-error+error_type=bad_request_error,nodes=3"]
+	require.True(t, ok)
+	assert.Equal(t, int64(1), nodesBadRequestErrors.Value())
+
 	assert.NoError(t, session.Close())
 }
 
@@ -184,7 +238,10 @@ func TestSessionWriteRetry(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	session := newRetryEnabledTestSession(t).(*session)
+	scope := tally.NewTestScope("", nil)
+	opts := newSessionTestOptions().
+		SetInstrumentOptions(instrument.NewOptions().SetMetricsScope(scope))
+	session := newRetryEnabledTestSession(t, opts).(*session)
 
 	w := struct {
 		ns         ident.ID
@@ -249,6 +306,12 @@ func TestSessionWriteRetry(t *testing.T) {
 	// Wait for write to complete
 	writeWg.Wait()
 	assert.Nil(t, resultErr)
+
+	// Assert counting bad request errors by number of nodes
+	counters := scope.Snapshot().Counters()
+	nodesBadRequestErrors, ok := counters["write.nodes-responding-error+error_type=server_error,nodes=3"]
+	require.True(t, ok)
+	assert.Equal(t, int64(1), nodesBadRequestErrors.Value())
 
 	assert.NoError(t, session.Close())
 }
@@ -430,11 +493,15 @@ func newDefaultTestSession(t *testing.T) clientSession {
 	return newTestSession(t, newSessionTestOptions())
 }
 
-func newRetryEnabledTestSession(t *testing.T) clientSession {
-	opts := newSessionTestOptions().
+func newRetryEnabledTestSession(t *testing.T, opts Options) clientSession {
+	opts = opts.
 		SetWriteRetrier(
 			xretry.NewRetrier(xretry.NewOptions().SetMaxRetries(1)))
 	return newTestSession(t, opts)
+}
+
+func newDefaultRetryEnabledTestSession(t *testing.T) clientSession {
+	return newRetryEnabledTestSession(t, newSessionTestOptions())
 }
 
 func newWriteStub() writeStub {

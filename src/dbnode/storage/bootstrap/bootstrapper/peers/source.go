@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/m3db/m3/src/cluster/shard"
 	"github.com/m3db/m3/src/dbnode/client"
 	"github.com/m3db/m3/src/dbnode/clock"
 	"github.com/m3db/m3/src/dbnode/persist"
@@ -35,7 +36,6 @@ import (
 	"github.com/m3db/m3/src/dbnode/storage/namespace"
 	"github.com/m3db/m3/src/dbnode/storage/series"
 	"github.com/m3db/m3/src/dbnode/topology"
-	"github.com/m3db/m3cluster/shard"
 	"github.com/m3db/m3x/context"
 	"github.com/m3db/m3x/instrument"
 	xlog "github.com/m3db/m3x/log"
@@ -82,9 +82,10 @@ func (s *peersSource) AvailableData(
 	nsMetadata namespace.Metadata,
 	shardsTimeRanges result.ShardTimeRanges,
 	runOpts bootstrap.RunOptions,
-) result.ShardTimeRanges {
-	// TODO: Call validateRunOpts here when we modify this interface
-	// to support returning errors.
+) (result.ShardTimeRanges, error) {
+	if err := s.validateRunOpts(runOpts); err != nil {
+		return nil, err
+	}
 	return s.peerAvailability(nsMetadata, shardsTimeRanges, runOpts)
 }
 
@@ -271,10 +272,9 @@ func (s *peersSource) fetchBootstrapBlocksFromPeers(
 		currRange := it.Value()
 
 		for blockStart := currRange.Start; blockStart.Before(currRange.End); blockStart = blockStart.Add(blockSize) {
-			version := s.opts.FetchBlocksMetadataEndpointVersion()
 			blockEnd := blockStart.Add(blockSize)
 			shardResult, err := session.FetchBootstrapBlocksFromPeers(
-				nsMetadata, shard, blockStart, blockEnd, bopts, version)
+				nsMetadata, shard, blockStart, blockEnd, bopts)
 
 			s.logFetchBootstrapBlocksFromPeersOutcome(shard, shardResult, err)
 
@@ -341,12 +341,7 @@ func (s *peersSource) logFetchBootstrapBlocksFromPeersOutcome(
 // shard/block and flushing it to disk. Depending on the series caching policy,
 // the series will either be held in memory, or removed from memory once
 // flushing has completed.
-// Once everything has been flushed to disk then depending on the series
-// caching policy the function is either done, or in the case of the
-// CacheAllMetadata policy we loop through every series and make every block
-// retrievable (so that we can retrieve data for the blocks that we're caching
-// the metadata for).
-// In addition, if the caching policy is not CacheAll or CacheAllMetadata, then
+// In addition, if the caching policy is not CacheAll, then
 // at the end we remove all the series objects from the shard result as well
 // (since all their corresponding blocks have been removed anyways) to prevent
 // a huge memory spike caused by adding lots of unused series to the Shard
@@ -363,14 +358,10 @@ func (s *peersSource) flush(
 	var (
 		ropts             = nsMetadata.Options().RetentionOptions()
 		blockSize         = ropts.BlockSize()
-		shardRetriever    = shardRetrieverMgr.ShardRetriever(shard)
 		tmpCtx            = context.NewContext()
 		seriesCachePolicy = s.opts.ResultOptions().SeriesCachePolicy()
 		persistConfig     = opts.PersistConfig()
 	)
-	if seriesCachePolicy == series.CacheAllMetadata && shardRetriever == nil {
-		return fmt.Errorf("shard retriever missing for shard: %d", shard)
-	}
 
 	for start := tr.Start; start.Before(tr.End); start = start.Add(blockSize) {
 		prepareOpts := persist.DataPrepareOptions{
@@ -439,18 +430,6 @@ func (s *peersSource) flush(
 				case series.CacheAll:
 					// Leave the blocks in the shard result, we need to return all blocks
 					// so we can cache in memory
-				case series.CacheAllMetadata:
-					// NB(r): We can now make the flushed blocks retrievable, note that we
-					// explicitly perform another loop here and lookup the block again
-					// to avoid a large expensive allocation to hold onto the blocks
-					// that we just flushed that would have to be pooled.
-					// We are explicitly trading CPU time here for lower GC pressure.
-					metadata := block.RetrievableBlockMetadata{
-						ID:       s.ID,
-						Length:   bl.Len(),
-						Checksum: checksum,
-					}
-					bl.ResetRetrievable(start, blockSize, shardRetriever, metadata)
 				default:
 					// Not caching the series or metadata in memory so finalize the block,
 					// better to do this as we loop through to make blocks return to the
@@ -485,15 +464,13 @@ func (s *peersSource) flush(
 		}
 	}
 
-	// We only want to retain the series metadata in one of three cases:
+	// We only want to retain the series metadata in one of two cases:
 	// 	1) CacheAll caching policy (because we're expected to cache everything in memory)
-	// 	2) CacheAllMetadata caching policy (because we're expected to cache all metadata in memory)
-	// 	3) PersistConfig.FileSetType is set to FileSetSnapshotType because that means we're bootstrapping
+	// 	2) PersistConfig.FileSetType is set to FileSetSnapshotType because that means we're bootstrapping
 	//     an active block that we'll want to perform a flush on later, and we're only flushing here for
 	//     the sake of allowing the commit log bootstrapper to be able to recover this data if the node
 	//     goes down in-between this bootstrapper completing and the subsequent flush.
 	shouldRetainSeriesMetadata := seriesCachePolicy == series.CacheAll ||
-		seriesCachePolicy == series.CacheAllMetadata ||
 		persistConfig.FileSetType == persist.FileSetSnapshotType
 
 	if !shouldRetainSeriesMetadata {
@@ -521,12 +498,13 @@ func (s *peersSource) flush(
 		}
 		if numSeriesTriedToRemoveWithRemainingBlocks > 0 {
 			iOpts := s.opts.ResultOptions().InstrumentOptions()
-			instrument.EmitInvariantViolationAndGetLogger(iOpts).
-				WithFields(
+			instrument.EmitAndLogInvariantViolation(iOpts, func(l xlog.Logger) {
+				l.WithFields(
 					xlog.NewField("start", tr.Start.Unix()),
 					xlog.NewField("end", tr.End.Unix()),
 					xlog.NewField("numTimes", numSeriesTriedToRemoveWithRemainingBlocks),
 				).Error("error tried to remove series that still has blocks")
+			})
 		}
 	}
 
@@ -550,9 +528,10 @@ func (s *peersSource) AvailableIndex(
 	nsMetadata namespace.Metadata,
 	shardsTimeRanges result.ShardTimeRanges,
 	runOpts bootstrap.RunOptions,
-) result.ShardTimeRanges {
-	// TODO: Call validateRunOpts here when we modify this interface
-	// to support returning errors.
+) (result.ShardTimeRanges, error) {
+	if err := s.validateRunOpts(runOpts); err != nil {
+		return nil, err
+	}
 	return s.peerAvailability(nsMetadata, shardsTimeRanges, runOpts)
 }
 
@@ -585,7 +564,6 @@ func (s *peersSource) ReadIndex(
 		dataBlockSize = ns.Options().RetentionOptions().BlockSize()
 		resultOpts    = s.opts.ResultOptions()
 		idxOpts       = ns.Options().IndexOptions()
-		version       = s.opts.FetchBlocksMetadataEndpointVersion()
 		resultLock    = &sync.Mutex{}
 		wg            sync.WaitGroup
 	)
@@ -621,7 +599,7 @@ func (s *peersSource) ReadIndex(
 					}
 
 					metadata, err := session.FetchBootstrapBlocksMetadataFromPeers(ns.ID(),
-						shard, currRange.Start, currRange.End, resultOpts, version)
+						shard, currRange.Start, currRange.End, resultOpts)
 					if err != nil {
 						// Make this period unfulfilled
 						markUnfulfilled(err)
@@ -711,7 +689,7 @@ func (s *peersSource) peerAvailability(
 	nsMetadata namespace.Metadata,
 	shardsTimeRanges result.ShardTimeRanges,
 	runOpts bootstrap.RunOptions,
-) result.ShardTimeRanges {
+) (result.ShardTimeRanges, error) {
 	var (
 		peerAvailabilityByShard = map[topology.ShardID]*shardPeerAvailability{}
 		initialTopologyState    = runOpts.InitialTopologyState()
@@ -753,10 +731,7 @@ func (s *peersSource) peerAvailability(
 			case shard.Unknown:
 				fallthrough
 			default:
-				// TODO(rartoul): Make this a hard error once we refactor the interface to support
-				// returning errors.
-				s.log.Errorf("unknown shard state: %v", shardState)
-				return result.ShardTimeRanges{}
+				return nil, fmt.Errorf("unknown shard state: %v", shardState)
 			}
 		}
 	}
@@ -768,19 +743,27 @@ func (s *peersSource) peerAvailability(
 		availableShardTimeRanges  = result.ShardTimeRanges{}
 	)
 	for shardIDUint := range shardsTimeRanges {
-		shardID := topology.ShardID(shardIDUint)
-		shardPeers := peerAvailabilityByShard[shardID]
+		var (
+			shardID    = topology.ShardID(shardIDUint)
+			shardPeers = peerAvailabilityByShard[shardID]
 
-		total := shardPeers.numPeers
-		available := shardPeers.numAvailablePeers
+			total     = shardPeers.numPeers
+			available = shardPeers.numAvailablePeers
+		)
 
 		if available == 0 {
 			// Can't peer bootstrap if there are no available peers.
+			s.log.Debugf(
+				"0 available peers out of %d for shard %d, unable to peer bootstrap",
+				total, shardIDUint)
 			continue
 		}
 
 		if !topology.ReadConsistencyAchieved(
 			bootstrapConsistencyLevel, majorityReplicas, total, available) {
+			s.log.Debugf(
+				"read consistency of %v not achieved with %d replicas and %d total and %d available, unable to peer bootstrap",
+				bootstrapConsistencyLevel, majorityReplicas, total, available)
 			continue
 		}
 
@@ -791,7 +774,7 @@ func (s *peersSource) peerAvailability(
 		availableShardTimeRanges[shardIDUint] = shardsTimeRanges[shardIDUint]
 	}
 
-	return availableShardTimeRanges
+	return availableShardTimeRanges, nil
 }
 
 func (s *peersSource) markIndexResultErrorAsUnfulfilled(

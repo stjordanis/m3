@@ -60,7 +60,7 @@ func calculateCardinality(fromFile string, logger *zap.Logger) (int, error) {
 	for scanner.Scan() {
 		tsdb := scanner.Text()
 		ts, _ := marshalTSDBToProm(tsdb)
-		tags := storage.PromLabelsToM3Tags(ts.GetLabels())
+		tags := storage.PromLabelsToM3Tags(ts.GetLabels(), models.NewTagOptions())
 		id := tags.ID()
 		tagsSeen[id]++
 
@@ -161,7 +161,13 @@ func marshalTSDBToProm(opentsdb string) (*prompb.TimeSeries, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, err
 	}
-	labels := storage.TagsToPromLabels(models.FromMap(m.Tags))
+
+	tags := models.EmptyTags()
+	for n, v := range m.Tags {
+		tags = tags.AddTag(models.Tag{Name: []byte(n), Value: []byte(v)})
+	}
+
+	labels := storage.TagsToPromLabels(tags)
 	samples := metricsPointsToSamples(m.Value, m.Time)
 	return &prompb.TimeSeries{
 		Labels:  labels,

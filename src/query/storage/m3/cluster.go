@@ -111,6 +111,26 @@ type ClusterNamespaceDownsampleOptions struct {
 // ClusterNamespaces is a slice of ClusterNamespace instances.
 type ClusterNamespaces []ClusterNamespace
 
+// ClusterNamespacesByResolutionAsc is a slice of ClusterNamespace instances is
+// sortable by resolution.
+type ClusterNamespacesByResolutionAsc []ClusterNamespace
+
+func (a ClusterNamespacesByResolutionAsc) Len() int      { return len(a) }
+func (a ClusterNamespacesByResolutionAsc) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+func (a ClusterNamespacesByResolutionAsc) Less(i, j int) bool {
+	return a[i].Options().Attributes().Resolution < a[j].Options().Attributes().Resolution
+}
+
+// ClusterNamespacesByRetentionAsc is a slice of ClusterNamespace instances is
+// sortable by retention.
+type ClusterNamespacesByRetentionAsc []ClusterNamespace
+
+func (a ClusterNamespacesByRetentionAsc) Len() int      { return len(a) }
+func (a ClusterNamespacesByRetentionAsc) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+func (a ClusterNamespacesByRetentionAsc) Less(i, j int) bool {
+	return a[i].Options().Attributes().Retention < a[j].Options().Attributes().Retention
+}
+
 // NumAggregatedClusterNamespaces returns the number of aggregated
 // cluster namespaces.
 func (n ClusterNamespaces) NumAggregatedClusterNamespaces() int {
@@ -275,7 +295,7 @@ func (c *clusters) Close() error {
 
 	wg.Wait()
 
-	return syncMultiErrs.finalError()
+	return syncMultiErrs.lastError()
 }
 
 type clusterNamespace struct {
@@ -353,8 +373,11 @@ func (errs *syncMultiErrs) add(err error) {
 	errs.Unlock()
 }
 
-func (errs *syncMultiErrs) finalError() error {
+func (errs *syncMultiErrs) lastError() error {
 	errs.Lock()
 	defer errs.Unlock()
-	return errs.multiErr.FinalError()
+	// TODO: consider taking a debug param when building a syncMultiErrs
+	// which would determine wether to return only the last error message
+	// or the consolidated list of errors.
+	return errs.multiErr.LastError()
 }

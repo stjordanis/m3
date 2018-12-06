@@ -33,19 +33,27 @@ import (
 
 var (
 	testID   = ident.StringID("test_id")
-	testTags = models.Tags{{Name: "t1", Value: "v1"}, {Name: "t2", Value: "v2"}}
-	now      = time.Now()
+	testTags = []models.Tag{
+		{Name: []byte("t1"), Value: []byte("v1")},
+		{Name: []byte("t2"), Value: []byte("v2")},
+	}
+	now = time.Now()
 )
 
+func makeTagIter() ident.TagIterator {
+	ts := models.EmptyTags().AddTags(testTags)
+	return TagsToIdentTagIterator(ts)
+}
+
 func TestTagsToIdentTagIterator(t *testing.T) {
-	tagIter := TagsToIdentTagIterator(testTags)
+	tagIter := makeTagIter()
 	defer tagIter.Close()
 
-	tags := make(models.Tags, len(testTags))
+	tags := make([]models.Tag, len(testTags))
 	for i := 0; tagIter.Next(); i++ {
 		tags[i] = models.Tag{
-			Name:  tagIter.Current().Name.String(),
-			Value: tagIter.Current().Value.String(),
+			Name:  tagIter.Current().Name.Bytes(),
+			Value: tagIter.Current().Value.Bytes(),
 		}
 	}
 
@@ -53,20 +61,23 @@ func TestTagsToIdentTagIterator(t *testing.T) {
 }
 
 func TestFromM3IdentToMetric(t *testing.T) {
-	tagIters := TagsToIdentTagIterator(testTags)
-	metric, err := FromM3IdentToMetric(testID, tagIters)
+	tagIters := makeTagIter()
+	name := []byte("foobarbaz")
+	metric, err := FromM3IdentToMetric(testID, tagIters, models.NewTagOptions().SetMetricName(name))
 	require.NoError(t, err)
 
 	assert.Equal(t, testID.String(), metric.ID)
-	assert.Equal(t, testTags, metric.Tags)
+	assert.Equal(t, testTags, metric.Tags.Tags)
+	assert.Equal(t, name, metric.Tags.Opts.MetricName())
 }
 
 func TestFromIdentTagIteratorToTags(t *testing.T) {
-	tagIters := TagsToIdentTagIterator(testTags)
-	tags, err := FromIdentTagIteratorToTags(tagIters)
+	tagIters := makeTagIter()
+	tags, err := FromIdentTagIteratorToTags(tagIters, nil)
 	require.NoError(t, err)
-
-	assert.Equal(t, testTags, tags)
+	require.Equal(t, len(testTags), tags.Len())
+	assert.Equal(t, testTags, tags.Tags)
+	assert.Equal(t, []byte("__name__"), tags.Opts.MetricName())
 }
 
 func TestFetchQueryToM3Query(t *testing.T) {
@@ -81,8 +92,8 @@ func TestFetchQueryToM3Query(t *testing.T) {
 			matchers: models.Matchers{
 				{
 					Type:  models.MatchEqual,
-					Name:  "t1",
-					Value: "v1",
+					Name:  []byte("t1"),
+					Value: []byte("v1"),
 				},
 			},
 		},
@@ -92,8 +103,8 @@ func TestFetchQueryToM3Query(t *testing.T) {
 			matchers: models.Matchers{
 				{
 					Type:  models.MatchNotEqual,
-					Name:  "t1",
-					Value: "v1",
+					Name:  []byte("t1"),
+					Value: []byte("v1"),
 				},
 			},
 		},
@@ -103,8 +114,8 @@ func TestFetchQueryToM3Query(t *testing.T) {
 			matchers: models.Matchers{
 				{
 					Type:  models.MatchRegexp,
-					Name:  "t1",
-					Value: "v1",
+					Name:  []byte("t1"),
+					Value: []byte("v1"),
 				},
 			},
 		},
@@ -114,8 +125,8 @@ func TestFetchQueryToM3Query(t *testing.T) {
 			matchers: models.Matchers{
 				{
 					Type:  models.MatchNotRegexp,
-					Name:  "t1",
-					Value: "v1",
+					Name:  []byte("t1"),
+					Value: []byte("v1"),
 				},
 			},
 		},

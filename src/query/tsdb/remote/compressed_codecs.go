@@ -28,12 +28,12 @@ import (
 
 	"github.com/m3db/m3/src/dbnode/encoding"
 	"github.com/m3db/m3/src/dbnode/encoding/m3tsz"
-	"github.com/m3db/m3/src/dbnode/serialize"
 	"github.com/m3db/m3/src/dbnode/ts"
 	"github.com/m3db/m3/src/dbnode/x/xio"
 	"github.com/m3db/m3/src/dbnode/x/xpool"
 	"github.com/m3db/m3/src/query/errors"
 	rpc "github.com/m3db/m3/src/query/generated/proto/rpcpb"
+	"github.com/m3db/m3/src/x/serialize"
 	"github.com/m3db/m3x/checked"
 	"github.com/m3db/m3x/ident"
 	xtime "github.com/m3db/m3x/time"
@@ -70,7 +70,9 @@ func compressedSegmentFromBlockReader(br xio.BlockReader) (*rpc.M3Segment, error
 	}, nil
 }
 
-func compressedSegmentsFromReaders(readers xio.ReaderSliceOfSlicesIterator) (*rpc.M3Segments, error) {
+func compressedSegmentsFromReaders(
+	readers xio.ReaderSliceOfSlicesIterator,
+) (*rpc.M3Segments, error) {
 	segments := &rpc.M3Segments{}
 	l, _, _ := readers.CurrentReaders()
 	// NB(arnikola) If there's only a single reader, the segment has been merged
@@ -100,7 +102,10 @@ func compressedSegmentsFromReaders(readers xio.ReaderSliceOfSlicesIterator) (*rp
 	return segments, nil
 }
 
-func compressedTagsFromTagIterator(tagIter ident.TagIterator, encoderPool serialize.TagEncoderPool) ([]byte, error) {
+func compressedTagsFromTagIterator(
+	tagIter ident.TagIterator,
+	encoderPool serialize.TagEncoderPool,
+) ([]byte, error) {
 	encoder := encoderPool.Get()
 	err := encoder.Encode(tagIter)
 	if err != nil {
@@ -113,7 +118,10 @@ func compressedTagsFromTagIterator(tagIter ident.TagIterator, encoderPool serial
 		return nil, fmt.Errorf("no refs available to data")
 	}
 
-	return data.Bytes(), nil
+	db := data.Bytes()
+	// Need to copy the encoded bytes to a buffer as the encoder keeps a reference to them
+	// TODO(arnikola): pool this when implementing https://github.com/m3db/m3/issues/1015
+	return append(make([]byte, 0, len(db)), db...), nil
 }
 
 func buildTags(tagIter ident.TagIterator, iterPools encoding.IteratorPools) ([]byte, error) {
@@ -140,7 +148,10 @@ SeriesIterator also has a TagIterator representing the tags associated with it
 This function transforms a SeriesIterator into a protobuf representation to be able
 to send it across the wire without needing to expand the series
 */
-func compressedSeriesFromSeriesIterator(it encoding.SeriesIterator, iterPools encoding.IteratorPools) (*rpc.Series, error) {
+func compressedSeriesFromSeriesIterator(
+	it encoding.SeriesIterator,
+	iterPools encoding.IteratorPools,
+) (*rpc.Series, error) {
 	replicas := it.Replicas()
 	compressedReplicas := make([]*rpc.M3CompressedValuesReplica, 0, len(replicas))
 	for _, replica := range replicas {
@@ -183,8 +194,8 @@ func compressedSeriesFromSeriesIterator(it encoding.SeriesIterator, iterPools en
 	}, nil
 }
 
-// EncodeToCompressedFetchResult encodes SeriesIterators to compressed fetch response
-func EncodeToCompressedFetchResult(
+// encodeToCompressedFetchResult encodes SeriesIterators to compressed fetch response
+func encodeToCompressedFetchResult(
 	iterators encoding.SeriesIterators,
 	iterPools encoding.IteratorPools,
 ) (*rpc.FetchResponse, error) {
@@ -380,8 +391,8 @@ func seriesIteratorFromCompressedSeries(
 	return seriesIter, nil
 }
 
-// DecodeCompressedFetchResponse decodes compressed fetch response to seriesIterators
-func DecodeCompressedFetchResponse(
+// decodeCompressedFetchResponse decodes compressed fetch response to seriesIterators
+func decodeCompressedFetchResponse(
 	fetchResult *rpc.FetchResponse,
 	iteratorPools encoding.IteratorPools,
 ) (encoding.SeriesIterators, error) {

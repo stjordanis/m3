@@ -28,6 +28,7 @@ import (
 
 	"github.com/m3db/m3/src/dbnode/integration/generate"
 	"github.com/m3db/m3/src/dbnode/retention"
+	"github.com/m3db/m3/src/dbnode/runtime"
 	"github.com/m3db/m3/src/dbnode/storage/bootstrap"
 	bcl "github.com/m3db/m3/src/dbnode/storage/bootstrap/bootstrapper/commitlog"
 	"github.com/m3db/m3/src/dbnode/storage/bootstrap/result"
@@ -108,7 +109,8 @@ func TestBootstrapAfterBufferRotation(t *testing.T) {
 	bootstrapOpts := newDefaulTestResultOptions(setup.storageOpts)
 	bootstrapCommitlogOpts := bcl.NewOptions().
 		SetResultOptions(bootstrapOpts).
-		SetCommitLogOptions(commitLogOpts)
+		SetCommitLogOptions(commitLogOpts).
+		SetRuntimeOptionsManager(runtime.NewOptionsManager())
 	fsOpts := setup.storageOpts.CommitLogOptions().FilesystemOptions()
 	commitlogBootstrapperProvider, err := bcl.NewCommitLogBootstrapperProvider(
 		bootstrapCommitlogOpts, mustInspectFilesystem(fsOpts), nil)
@@ -133,9 +135,10 @@ func TestBootstrapAfterBufferRotation(t *testing.T) {
 		},
 	}, bootstrapOpts, bootstrapper)
 
-	processOpts := bootstrap.NewProcessOptions().SetAdminClient(
-		setup.m3dbAdminClient,
-	)
+	processOpts := bootstrap.NewProcessOptions().
+		SetTopologyMapProvider(setup).
+		SetOrigin(setup.origin)
+
 	processProvider, err := bootstrap.NewProcessProvider(
 		test, processOpts, bootstrapOpts)
 	require.NoError(t, err)

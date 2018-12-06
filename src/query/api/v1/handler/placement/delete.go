@@ -24,27 +24,42 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path"
+	"time"
 
-	"github.com/m3db/m3/src/cmd/services/m3query/config"
+	"github.com/m3db/m3/src/cluster/placement"
 	"github.com/m3db/m3/src/query/api/v1/handler"
 	"github.com/m3db/m3/src/query/generated/proto/admin"
 	"github.com/m3db/m3/src/query/util/logging"
-	clusterclient "github.com/m3db/m3cluster/client"
+	"github.com/m3db/m3/src/x/net/http"
 
 	"github.com/gorilla/mux"
 	"go.uber.org/zap"
 )
 
 const (
-	placementIDVar = "id"
+	placementIDVar    = "id"
+	placementForceVar = "force"
 
 	// DeleteHTTPMethod is the HTTP method used with this resource.
 	DeleteHTTPMethod = http.MethodDelete
 )
 
 var (
-	// DeleteURL is the url for the placement delete handler.
-	DeleteURL = fmt.Sprintf("%s/placement/{%s}", handler.RoutePrefixV1, placementIDVar)
+	placementIDPath = fmt.Sprintf("{%s}", placementIDVar)
+
+	// DeprecatedM3DBDeleteURL is the old url for the placement delete handler, maintained
+	// for backwards compatibility.
+	DeprecatedM3DBDeleteURL = path.Join(handler.RoutePrefixV1, PlacementPathName, placementIDPath)
+
+	// M3DBDeleteURL is the url for the placement delete handler for the M3DB service.
+	M3DBDeleteURL = path.Join(handler.RoutePrefixV1, M3DBServicePlacementPathName, placementIDPath)
+
+	// M3AggDeleteURL is the url for the placement delete handler for the M3Agg service.
+	M3AggDeleteURL = path.Join(handler.RoutePrefixV1, M3AggServicePlacementPathName, placementIDPath)
+
+	// M3CoordinatorDeleteURL is the url for the placement delete handler for the M3Coordinator service.
+	M3CoordinatorDeleteURL = path.Join(handler.RoutePrefixV1, M3CoordinatorServicePlacementPathName, placementIDPath)
 
 	errEmptyID = errors.New("must specify placement ID to delete")
 )
@@ -53,43 +68,98 @@ var (
 type DeleteHandler Handler
 
 // NewDeleteHandler returns a new instance of DeleteHandler.
-func NewDeleteHandler(client clusterclient.Client, cfg config.Configuration) *DeleteHandler {
-	return &DeleteHandler{client: client, cfg: cfg}
+func NewDeleteHandler(opts HandlerOptions) *DeleteHandler {
+	return &DeleteHandler{HandlerOptions: opts, nowFn: time.Now}
 }
 
-func (h *DeleteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	logger := logging.WithContext(ctx)
-	id := mux.Vars(r)[placementIDVar]
+func (h *DeleteHandler) ServeHTTP(serviceName string, w http.ResponseWriter, r *http.Request) {
+	var (
+		ctx    = r.Context()
+		logger = logging.WithContext(ctx)
+		id     = mux.Vars(r)[placementIDVar]
+	)
+
 	if id == "" {
 		logger.Error("no placement ID provided to delete", zap.Any("error", errEmptyID))
-		handler.Error(w, errEmptyID, http.StatusBadRequest)
+		xhttp.Error(w, errEmptyID, http.StatusBadRequest)
 		return
 	}
 
-	service, err := Service(h.client, r.Header)
+	var (
+		force = r.FormValue(placementForceVar) == "true"
+		opts  = NewServiceOptions(
+			serviceName, r.Header, h.M3AggServiceOptions)
+	)
+
+	service, algo, err := ServiceWithAlgo(h.ClusterClient, opts, h.nowFn(), nil)
 	if err != nil {
-		handler.Error(w, err, http.StatusInternalServerError)
+		xhttp.Error(w, err, http.StatusInternalServerError)
 		return
 	}
 
-	placement, err := service.RemoveInstances([]string{id})
-	if err != nil {
-		logger.Error("unable to delete placement", zap.Any("error", err))
-		handler.Error(w, err, http.StatusNotFound)
-		return
+	toRemove := []string{id}
+
+	// There are no unsafe placement changes because M3Coordinator is stateless
+	if isStateless(serviceName) {
+		force = true
 	}
 
-	placementProto, err := placement.Proto()
+	var newPlacement placement.Placement
+	if force {
+		newPlacement, err = service.RemoveInstances(toRemove)
+		if err != nil {
+			logger.Error("unable to delete instances", zap.Any("error", err))
+			xhttp.Error(w, err, http.StatusNotFound)
+			return
+		}
+	} else {
+		curPlacement, err := service.Placement()
+		if err != nil {
+			logger.Error("unable to fetch placement", zap.Error(err))
+			xhttp.Error(w, err, http.StatusInternalServerError)
+			return
+		}
+
+		if err := validateAllAvailable(curPlacement); err != nil {
+			logger.Info("unable to remove instance, some shards not available", zap.Error(err), zap.String("instance", id))
+			xhttp.Error(w, err, http.StatusBadRequest)
+			return
+		}
+
+		_, ok := curPlacement.Instance(id)
+		if !ok {
+			logger.Info("instance not found in placement", zap.String("instance", id))
+			err := fmt.Errorf("instance %s not found in placement", id)
+			xhttp.Error(w, err, http.StatusNotFound)
+			return
+		}
+
+		newPlacement, err = algo.RemoveInstances(curPlacement, toRemove)
+		if err != nil {
+			logger.Info("unable to generate placement with instances removed", zap.String("instance", id), zap.Error(err))
+			xhttp.Error(w, err, http.StatusBadRequest)
+			return
+		}
+
+		newPlacement, err = service.CheckAndSet(newPlacement, curPlacement.Version())
+		if err != nil {
+			logger.Info("unable to remove instance from placement", zap.String("instance", id), zap.Error(err))
+			xhttp.Error(w, err, http.StatusBadRequest)
+			return
+		}
+	}
+
+	placementProto, err := newPlacement.Proto()
 	if err != nil {
 		logger.Error("unable to get placement protobuf", zap.Any("error", err))
-		handler.Error(w, err, http.StatusInternalServerError)
+		xhttp.Error(w, err, http.StatusInternalServerError)
 		return
 	}
 
 	resp := &admin.PlacementGetResponse{
 		Placement: placementProto,
+		Version:   int32(newPlacement.Version()),
 	}
 
-	handler.WriteProtoMsgJSONResponse(w, resp, logger)
+	xhttp.WriteProtoMsgJSONResponse(w, resp, logger)
 }

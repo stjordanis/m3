@@ -37,7 +37,7 @@ import (
 	"github.com/leanovate/gopter"
 	"github.com/leanovate/gopter/gen"
 	"github.com/leanovate/gopter/prop"
-	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestShardTickReadFnRace(t *testing.T) {
@@ -55,7 +55,7 @@ func TestShardTickReadFnRace(t *testing.T) {
 		},
 		anyIDs().WithLabel("ids"),
 		gen.UInt8().WithLabel("tickBatchSize").SuchThat(func(x uint8) bool { return x > 0 }),
-		gen.OneConstOf(fetchBlocksMetadataShardFn, fetchBlocksMetadataV2ShardFn),
+		gen.OneConstOf(fetchBlocksMetadataV2ShardFn),
 	))
 
 	reporter := gopter.NewFormatedReporter(true, 160, os.Stdout)
@@ -91,18 +91,6 @@ func testShardTickReadFnRace(t *testing.T, ids []ident.ID, tickBatchSize int, fn
 }
 
 type testShardReadFn func(shard *dbShard)
-
-var fetchBlocksMetadataShardFn testShardReadFn = func(shard *dbShard) {
-	ctx := context.NewContext()
-	start := time.Time{}
-	end := time.Now()
-	shard.FetchBlocksMetadata(ctx, start, end, 100, 0, block.FetchBlocksMetadataOptions{
-		IncludeChecksums: true,
-		IncludeLastRead:  true,
-		IncludeSizes:     true,
-	})
-	ctx.BlockingClose()
-}
 
 var fetchBlocksMetadataV2ShardFn testShardReadFn = func(shard *dbShard) {
 	ctx := context.NewContext()
@@ -155,28 +143,36 @@ func TestShardTickWriteRace(t *testing.T) {
 
 	wg.Add(numRoutines)
 
+	doneFn := func() {
+		if r := recover(); r != nil {
+			assert.Fail(t, "unexpected panic: %v", r)
+		}
+		wg.Done()
+	}
+
 	for _, id := range ids {
 		id := id
 		go func() {
+			defer doneFn()
 			<-barrier
 			ctx := context.NewContext()
 			now := time.Now()
-			require.NoError(t, shard.Write(ctx, id, now, 1.0, xtime.Second, nil))
+			_, err := shard.Write(ctx, id, now, 1.0, xtime.Second, nil)
+			assert.NoError(t, err)
 			ctx.BlockingClose()
-			wg.Done()
 		}()
 	}
 
 	go func() {
+		defer doneFn()
 		<-barrier
 		fetchBlocksMetadataV2ShardFn(shard)
-		wg.Done()
 	}()
 
 	go func() {
+		defer doneFn()
 		<-barrier
 		shard.Tick(context.NewNoOpCanncellable(), time.Now())
-		wg.Done()
 	}()
 
 	for i := 0; i < numRoutines; i++ {

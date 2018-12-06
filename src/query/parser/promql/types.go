@@ -22,12 +22,16 @@ package promql
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/m3db/m3/src/query/functions"
 	"github.com/m3db/m3/src/query/functions/aggregation"
 	"github.com/m3db/m3/src/query/functions/binary"
 	"github.com/m3db/m3/src/query/functions/linear"
+	"github.com/m3db/m3/src/query/functions/scalar"
+	"github.com/m3db/m3/src/query/functions/tag"
 	"github.com/m3db/m3/src/query/functions/temporal"
+	"github.com/m3db/m3/src/query/functions/unconsolidated"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/parser"
 	"github.com/m3db/m3/src/query/parser/common"
@@ -37,8 +41,11 @@ import (
 )
 
 // NewSelectorFromVector creates a new fetchop
-func NewSelectorFromVector(n *promql.VectorSelector) (parser.Params, error) {
-	matchers, err := labelMatchersToModelMatcher(n.LabelMatchers)
+func NewSelectorFromVector(
+	n *promql.VectorSelector,
+	tagOpts models.TagOptions,
+) (parser.Params, error) {
+	matchers, err := LabelMatchersToModelMatcher(n.LabelMatchers, tagOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -51,21 +58,33 @@ func NewSelectorFromVector(n *promql.VectorSelector) (parser.Params, error) {
 }
 
 // NewSelectorFromMatrix creates a new fetchop
-func NewSelectorFromMatrix(n *promql.MatrixSelector) (parser.Params, error) {
-	matchers, err := labelMatchersToModelMatcher(n.LabelMatchers)
+func NewSelectorFromMatrix(
+	n *promql.MatrixSelector,
+	tagOpts models.TagOptions,
+) (parser.Params, error) {
+	matchers, err := LabelMatchersToModelMatcher(n.LabelMatchers, tagOpts)
 	if err != nil {
 		return nil, err
 	}
 
-	return functions.FetchOp{Name: n.Name, Offset: n.Offset, Matchers: matchers, Range: n.Range}, nil
+	return functions.FetchOp{
+		Name:     n.Name,
+		Offset:   n.Offset,
+		Matchers: matchers,
+		Range:    n.Range,
+	}, nil
 }
 
 // NewAggregationOperator creates a new aggregation operator based on the type
 func NewAggregationOperator(expr *promql.AggregateExpr) (parser.Params, error) {
 	opType := expr.Op
+	byteMatchers := make([][]byte, len(expr.Grouping))
+	for i, grouping := range expr.Grouping {
+		byteMatchers[i] = []byte(grouping)
+	}
 
 	nodeInformation := aggregation.NodeParams{
-		MatchingTags: expr.Grouping,
+		MatchingTags: byteMatchers,
 		Without:      expr.Without,
 	}
 
@@ -123,8 +142,11 @@ func getAggOpType(opType promql.ItemType) string {
 }
 
 // NewScalarOperator creates a new scalar operator
-func NewScalarOperator(expr *promql.NumberLiteral) parser.Params {
-	return functions.NewScalarOp(expr.Val)
+func NewScalarOperator(expr *promql.NumberLiteral) (parser.Params, error) {
+	return scalar.NewScalarOp(
+		func(_ time.Time) float64 { return expr.Val },
+		scalar.ScalarType,
+	)
 }
 
 // NewBinaryOperator creates a new binary operator based on the type
@@ -145,39 +167,78 @@ func NewBinaryOperator(expr *promql.BinaryExpr, lhs, rhs parser.NodeID) (parser.
 }
 
 // NewFunctionExpr creates a new function expr based on the type
-func NewFunctionExpr(name string, argValues []interface{}) (parser.Params, error) {
+func NewFunctionExpr(
+	name string,
+	argValues []interface{},
+	stringValues []string,
+) (parser.Params, bool, error) {
+	var p parser.Params
+	var err error
+
 	switch name {
 	case linear.AbsType, linear.CeilType, linear.ExpType, linear.FloorType, linear.LnType,
 		linear.Log10Type, linear.Log2Type, linear.SqrtType:
-		return linear.NewMathOp(name)
+		p, err = linear.NewMathOp(name)
+		return p, true, err
 
 	case linear.AbsentType:
-		return linear.NewAbsentOp(), nil
+		p = linear.NewAbsentOp()
+		return p, true, err
 
 	case linear.ClampMinType, linear.ClampMaxType:
-		return linear.NewClampOp(argValues, name)
+		p, err = linear.NewClampOp(argValues, name)
+		return p, true, err
 
 	case linear.RoundType:
-		return linear.NewRoundOp(argValues)
+		p, err = linear.NewRoundOp(argValues)
+		return p, true, err
 
 	case linear.DayOfMonthType, linear.DayOfWeekType, linear.DaysInMonthType, linear.HourType,
 		linear.MinuteType, linear.MonthType, linear.YearType:
-		return linear.NewDateOp(name)
+		p, err = linear.NewDateOp(name)
+		return p, true, err
+
+	case tag.TagJoinType, tag.TagReplaceType:
+		p, err = tag.NewTagOp(name, stringValues)
+		return p, true, err
 
 	case temporal.AvgType, temporal.CountType, temporal.MinType,
 		temporal.MaxType, temporal.SumType, temporal.StdDevType,
 		temporal.StdVarType:
-		return temporal.NewAggOp(argValues, name)
+		p, err = temporal.NewAggOp(argValues, name)
+		return p, true, err
 
-	case temporal.IRateType, temporal.IDeltaType:
-		return temporal.NewRateOp(argValues, name)
+	case temporal.HoltWintersType:
+		p, err = temporal.NewHoltWintersOp(argValues)
+		return p, true, err
+
+	case temporal.IRateType, temporal.IDeltaType, temporal.RateType, temporal.IncreaseType,
+		temporal.DeltaType:
+		p, err = temporal.NewRateOp(argValues, name)
+		return p, true, err
+
+	case temporal.PredictLinearType, temporal.DerivType:
+		p, err = temporal.NewLinearRegressionOp(argValues, name)
+		return p, true, err
 
 	case temporal.ResetsType, temporal.ChangesType:
-		return temporal.NewFunctionOp(argValues, name)
+		p, err = temporal.NewFunctionOp(argValues, name)
+		return p, true, err
+
+	case linear.SortType, linear.SortDescType:
+		return nil, false, err
+
+	case unconsolidated.TimestampType:
+		p, err = unconsolidated.NewTimestampOp(name)
+		return p, true, err
+
+	case scalar.TimeType:
+		p, err = scalar.NewScalarOp(func(t time.Time) float64 { return float64(t.Unix()) }, scalar.TimeType)
+		return p, true, err
 
 	default:
 		// TODO: handle other types
-		return nil, fmt.Errorf("function not supported: %s", name)
+		return nil, false, fmt.Errorf("function not supported: %s", name)
 	}
 }
 
@@ -221,7 +282,13 @@ func getBinaryOpType(opType promql.ItemType) string {
 	}
 }
 
-func labelMatchersToModelMatcher(lMatchers []*labels.Matcher) (models.Matchers, error) {
+const promDefaultName = "__name__"
+
+// LabelMatchersToModelMatcher parses promql matchers to model matchers
+func LabelMatchersToModelMatcher(
+	lMatchers []*labels.Matcher,
+	tagOpts models.TagOptions,
+) (models.Matchers, error) {
 	matchers := make(models.Matchers, len(lMatchers))
 	for i, m := range lMatchers {
 		modelType, err := promTypeToM3(m.Type)
@@ -229,7 +296,14 @@ func labelMatchersToModelMatcher(lMatchers []*labels.Matcher) (models.Matchers, 
 			return nil, err
 		}
 
-		match, err := models.NewMatcher(modelType, m.Name, m.Value)
+		var name []byte
+		if m.Name == promDefaultName {
+			name = tagOpts.MetricName()
+		} else {
+			name = []byte(m.Name)
+		}
+
+		match, err := models.NewMatcher(modelType, name, []byte(m.Value))
 		if err != nil {
 			return nil, err
 		}
@@ -278,9 +352,15 @@ func promMatchingToM3(vectorMatching *promql.VectorMatching) *binary.VectorMatch
 	if vectorMatching == nil {
 		return nil
 	}
+
+	byteMatchers := make([][]byte, len(vectorMatching.MatchingLabels))
+	for i, label := range vectorMatching.MatchingLabels {
+		byteMatchers[i] = []byte(label)
+	}
+
 	return &binary.VectorMatching{
 		Card:           promVectorCardinalityToM3(vectorMatching.Card),
-		MatchingLabels: vectorMatching.MatchingLabels,
+		MatchingLabels: byteMatchers,
 		On:             vectorMatching.On,
 		Include:        vectorMatching.Include,
 	}

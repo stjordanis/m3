@@ -21,6 +21,7 @@
 package m3
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/m3db/m3/src/dbnode/encoding"
@@ -29,109 +30,180 @@ import (
 )
 
 // TODO: use a better seriesIterators merge here
-type multiFetchResult struct {
+type multiResult struct {
 	sync.Mutex
-	sync.Once
-	iterators        encoding.SeriesIterators
-	err              xerrors.MultiError
-	dedupeFirstAttrs storage.Attributes
-	dedupeMap        map[string]multiFetchResultSeries
-	// Need to keep track of seen iterators, otherwise they are not
-	// properly cleaned up and returned to the pool; can also leak
-	// duplciate series iterators.
-	seenIters []encoding.SeriesIterators
-	pools     encoding.IteratorPools
+	fanout         queryFanoutType
+	seenFirstAttrs storage.Attributes
+	seenIters      []encoding.SeriesIterators // track known iterators to avoid leaking
+	finalResult    encoding.MutableSeriesIterators
+	dedupeMap      map[string]multiResultSeries
+	err            xerrors.MultiError
+
+	pools encoding.IteratorPools
 }
 
-type multiFetchResultSeries struct {
-	idx   int
+func newMultiFetchResult(
+	fanout queryFanoutType,
+	pools encoding.IteratorPools,
+) MultiFetchResult {
+	return &multiResult{
+		fanout: fanout,
+		pools:  pools,
+	}
+}
+
+type multiResultSeries struct {
 	attrs storage.Attributes
+	iter  encoding.SeriesIterator
 }
 
-func (r *multiFetchResult) close() error {
+func (r *multiResult) Close() error {
+	r.Lock()
+	defer r.Unlock()
+
 	for _, iters := range r.seenIters {
 		iters.Close()
 	}
+	r.seenIters = nil
+
+	if r.finalResult != nil {
+		// NB(r): Since all the series iterators in the final result are held onto
+		// by the original iters in the seenIters slice we allow those iterators
+		// to free iterators held onto by final result, and reset the slice for
+		// the final result to zero so we avoid double returning the iterators
+		// themselves.
+		r.finalResult.Reset(0)
+		r.finalResult.Close()
+		r.finalResult = nil
+	}
+
+	r.dedupeMap = nil
+	r.err = xerrors.NewMultiError()
 
 	return nil
 }
 
-func (r *multiFetchResult) setPools(pools encoding.IteratorPools) {
+func (r *multiResult) FinalResult() (encoding.SeriesIterators, error) {
 	r.Lock()
-	r.Do(func() {
-		r.pools = pools
-	})
-	r.Unlock()
+	defer r.Unlock()
+
+	err := r.err.LastError()
+	if err != nil {
+		return nil, err
+	}
+	if r.finalResult != nil {
+		return r.finalResult, nil
+	}
+
+	if len(r.seenIters) == 0 {
+		return encoding.EmptySeriesIterators, nil
+	}
+
+	// can short-cicuit in this case
+	if len(r.seenIters) == 1 {
+		return r.seenIters[0], nil
+	}
+
+	// otherwise have to create a new seriesiters
+	numSeries := len(r.dedupeMap)
+	r.finalResult = r.pools.MutableSeriesIterators().Get(numSeries)
+	r.finalResult.Reset(numSeries)
+
+	i := 0
+	for _, res := range r.dedupeMap {
+		r.finalResult.SetAt(i, res.iter)
+		i++
+	}
+
+	return r.finalResult, nil
 }
 
-func (r *multiFetchResult) add(
+func (r *multiResult) Add(
 	attrs storage.Attributes,
-	iterators encoding.SeriesIterators,
+	newIterators encoding.SeriesIterators,
 	err error,
 ) {
 	r.Lock()
 	defer r.Unlock()
-	r.seenIters = append(r.seenIters, iterators)
 
 	if err != nil {
 		r.err = r.err.Add(err)
 		return
 	}
 
-	if r.iterators == nil {
-		r.iterators = iterators
-		r.dedupeFirstAttrs = attrs
+	if len(r.seenIters) == 0 {
+		// store the first attributes seen
+		r.seenFirstAttrs = attrs
+	}
+	r.seenIters = append(r.seenIters, newIterators)
+
+	// Need to check the error to bail early after accumulating the iterators
+	// otherwise when we close the the multi fetch result
+	if !r.err.Empty() {
+		// don't need to do anything if the final result is going to be an error
 		return
 	}
 
-	iters := iterators.Iters()
-	// Need to dedupe
-	if r.dedupeMap == nil {
-		r.dedupeMap = make(map[string]multiFetchResultSeries, len(iters))
-		for idx, s := range iters {
-			r.dedupeMap[s.ID().String()] = multiFetchResultSeries{
-				idx:   idx,
-				attrs: r.dedupeFirstAttrs,
-			}
-		}
+	if len(r.seenIters) < 2 {
+		// don't need to create the de-dupe map until we need to actually need to
+		// dedupe between two results
+		return
 	}
 
-	r.dedupe(attrs, iterators)
+	if len(r.seenIters) == 2 {
+		// need to backfill the dedupe map from the first result first
+		first := r.seenIters[0]
+		r.dedupeMap = make(map[string]multiResultSeries, first.Len())
+		r.addOrUpdateDedupeMap(r.seenFirstAttrs, first)
+	}
+
+	// Now de-duplicate
+	r.addOrUpdateDedupeMap(attrs, newIterators)
 }
 
-func (r *multiFetchResult) dedupe(
+func (r *multiResult) addOrUpdateDedupeMap(
 	attrs storage.Attributes,
-	iterators encoding.SeriesIterators,
+	newIterators encoding.SeriesIterators,
 ) {
-	iters := iterators.Iters()
-	for _, s := range iters {
-		id := s.ID().String()
+	for _, iter := range newIterators.Iters() {
+		id := iter.ID().String()
+
 		existing, exists := r.dedupeMap[id]
-		if exists && existing.attrs.Resolution <= attrs.Resolution {
-			// Already exists and resolution of result we are adding is not as precise
+		if !exists {
+			// Does not exist, new addition
+			r.dedupeMap[id] = multiResultSeries{
+				attrs: attrs,
+				iter:  iter,
+			}
 			continue
 		}
 
-		// Does not exist already or more precise, add result
-		var idx int
-		currentIters := r.iterators.Iters()
-		if !exists {
-			idx = len(currentIters)
-			currentIters = append(currentIters, s)
-		} else {
-			idx = existing.idx
-			currentIters[idx] = s
+		var existsBetter bool
+		switch r.fanout {
+		case namespaceCoversAllQueryRange:
+			// Already exists and resolution of result we are adding is not as precise
+			existsBetter = existing.attrs.Resolution <= attrs.Resolution
+		case namespaceCoversPartialQueryRange:
+			// Already exists and either has longer retention, or the same retention
+			// and result we are adding is not as precise
+			existsLongerRetention := existing.attrs.Retention > attrs.Retention
+			existsSameRetentionEqualOrBetterResolution :=
+				existing.attrs.Retention == attrs.Retention &&
+					existing.attrs.Resolution <= attrs.Resolution
+			existsBetter = existsLongerRetention || existsSameRetentionEqualOrBetterResolution
+		default:
+			r.err = r.err.Add(fmt.Errorf("unknown query fanout type: %d", r.fanout))
+			return
+		}
+		if existsBetter {
+			// Existing result is already better
+			continue
 		}
 
-		var pool encoding.MutableSeriesIteratorsPool
-		if r.pools != nil {
-			pool = r.pools.MutableSeriesIterators()
-		}
-
-		r.iterators = encoding.NewSeriesIterators(currentIters, pool)
-		r.dedupeMap[id] = multiFetchResultSeries{
-			idx:   idx,
+		// Override
+		r.dedupeMap[id] = multiResultSeries{
 			attrs: attrs,
+			iter:  iter,
 		}
 	}
 }

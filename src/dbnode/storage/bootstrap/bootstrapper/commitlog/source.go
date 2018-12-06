@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/m3db/m3/src/cluster/shard"
 	"github.com/m3db/m3/src/dbnode/encoding"
 	"github.com/m3db/m3/src/dbnode/persist"
 	"github.com/m3db/m3/src/dbnode/persist/fs"
@@ -39,7 +40,6 @@ import (
 	"github.com/m3db/m3/src/dbnode/topology"
 	"github.com/m3db/m3/src/dbnode/ts"
 	"github.com/m3db/m3/src/dbnode/x/xio"
-	"github.com/m3db/m3cluster/shard"
 	"github.com/m3db/m3x/checked"
 	"github.com/m3db/m3x/ident"
 	"github.com/m3db/m3x/instrument"
@@ -47,6 +47,8 @@ import (
 	"github.com/m3db/m3x/pool"
 	xsync "github.com/m3db/m3x/sync"
 	xtime "github.com/m3db/m3x/time"
+
+	"github.com/uber-go/tally"
 )
 
 var (
@@ -55,7 +57,8 @@ var (
 
 const encoderChanBufSize = 1000
 
-type newIteratorFn func(opts commitlog.IteratorOpts) (commitlog.Iterator, error)
+type newIteratorFn func(opts commitlog.IteratorOpts) (
+	iter commitlog.Iterator, corruptFiles []commitlog.ErrorWithPath, err error)
 type snapshotFilesFn func(filePathPrefix string, namespace ident.ID, shard uint32) (fs.FileSetFilesSlice, error)
 type newReaderFn func(bytesPool pool.CheckedBytesPool, opts fs.Options) (fs.DataFileSetReader, error)
 
@@ -69,6 +72,8 @@ type commitLogSource struct {
 	newIteratorFn   newIteratorFn
 	snapshotFilesFn snapshotFilesFn
 	newReaderFn     newReaderFn
+
+	metrics commitLogSourceDataAndIndexMetrics
 }
 
 type encoder struct {
@@ -77,6 +82,12 @@ type encoder struct {
 }
 
 func newCommitLogSource(opts Options, inspection fs.Inspection) bootstrap.Source {
+	scope := opts.
+		ResultOptions().
+		InstrumentOptions().
+		MetricsScope().
+		SubScope("bootstrapper-commitlog")
+
 	return &commitLogSource{
 		opts: opts,
 		log: opts.
@@ -90,6 +101,8 @@ func newCommitLogSource(opts Options, inspection fs.Inspection) bootstrap.Source
 		newIteratorFn:   commitlog.NewIterator,
 		snapshotFilesFn: fs.SnapshotFiles,
 		newReaderFn:     fs.NewReader,
+
+		metrics: newCommitLogSourceDataAndIndexMetrics(scope),
 	}
 }
 
@@ -105,7 +118,7 @@ func (s *commitLogSource) AvailableData(
 	ns namespace.Metadata,
 	shardsTimeRanges result.ShardTimeRanges,
 	runOpts bootstrap.RunOptions,
-) result.ShardTimeRanges {
+) (result.ShardTimeRanges, error) {
 	return s.availability(ns, shardsTimeRanges, runOpts)
 }
 
@@ -184,9 +197,13 @@ func (s *commitLogSource) ReadData(
 	}
 
 	var (
-		fsOpts         = s.opts.CommitLogOptions().FilesystemOptions()
-		filePathPrefix = fsOpts.FilePathPrefix()
+		// Emit bootstrapping gauge for duration of ReadData
+		doneReadingData        = s.metrics.data.emitBootstrapping()
+		encounteredCorruptData = false
+		fsOpts                 = s.opts.CommitLogOptions().FilesystemOptions()
+		filePathPrefix         = fsOpts.FilePathPrefix()
 	)
+	defer doneReadingData()
 
 	// Determine which snapshot files are available.
 	snapshotFilesByShard, err := s.snapshotFilesByShard(
@@ -241,9 +258,14 @@ func (s *commitLogSource) ReadData(
 		s.log.Infof("datapointsRead: %d", datapointsRead)
 	}()
 
-	iter, err := s.newIteratorFn(iterOpts)
+	iter, corruptFiles, err := s.newIteratorFn(iterOpts)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create commit log iterator: %v", err)
+	}
+
+	if len(corruptFiles) > 0 {
+		s.logAndEmitCorruptFiles(corruptFiles, true)
+		encounteredCorruptData = true
 	}
 
 	defer iter.Close()
@@ -302,7 +324,14 @@ func (s *commitLogSource) ReadData(
 	}
 
 	if iterErr := iter.Err(); iterErr != nil {
-		return nil, iterErr
+		// Log the error and mark that we encountered corrupt data, but don't
+		// return the error because we want to give the peers bootstrapper the
+		// opportunity to repair the data instead of failing the bootstrap
+		// altogether.
+		s.log.Errorf(
+			"error in commitlog iterator: %v", iterErr)
+		s.metrics.data.corruptCommitlogFile.Inc(1)
+		encounteredCorruptData = true
 	}
 
 	for _, encoderChan := range encoderChans {
@@ -316,8 +345,8 @@ func (s *commitLogSource) ReadData(
 
 	// Merge all the different encoders from the commit log that we created with
 	// the data that is available in the snapshot files.
-	mergeStart := time.Now()
 	s.log.Infof("starting merge...")
+	mergeStart := time.Now()
 	bootstrapResult, err := s.mergeAllShardsCommitLogEncodersAndSnapshots(
 		ns,
 		shardsTimeRanges,
@@ -331,6 +360,16 @@ func (s *commitLogSource) ReadData(
 		return nil, err
 	}
 	s.log.Infof("done merging..., took: %s", time.Since(mergeStart).String())
+
+	shouldReturnUnfulfilled, err := s.shouldReturnUnfulfilled(
+		encounteredCorruptData, ns, shardsTimeRanges, runOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	if shouldReturnUnfulfilled {
+		bootstrapResult.SetUnfulfilled(shardsTimeRanges)
+	}
 
 	return bootstrapResult, nil
 }
@@ -592,7 +631,7 @@ func (s *commitLogSource) bootstrapShardBlockSnapshot(
 		return shardResult, err
 	}
 
-	s.log.Infof(
+	s.log.Debugf(
 		"reading snapshot for shard: %d and blockStart: %s and volume: %d",
 		shard, blockStart.String(), mostRecentCompleteSnapshot.ID.VolumeIndex)
 	for {
@@ -682,7 +721,7 @@ func (s *commitLogSource) newReadCommitLogPredBasedOnAvailableSnapshotFiles(
 	shardsTimeRanges result.ShardTimeRanges,
 	snapshotFilesByShard map[uint32]fs.FileSetFilesSlice,
 ) (
-	func(f commitlog.File) bool,
+	commitlog.FileFilterPredicate,
 	map[xtime.UnixNano]map[uint32]fs.FileSetFile,
 	error,
 ) {
@@ -703,9 +742,9 @@ func (s *commitLogSource) newReadCommitLogPredBasedOnAvailableSnapshotFiles(
 
 			if mostRecent.CachedSnapshotTime.IsZero() {
 				// Should never happen.
-				return nil, nil, fmt.Errorf(
-					"%s shard: %d and block: %s had zero value for most recent snapshot time",
-					instrument.InvariantViolatedMetricName, shard, block.ToTime().String())
+				return nil, nil, instrument.InvariantErrorf(
+					"shard: %d and block: %s had zero value for most recent snapshot time",
+					shard, block.ToTime().String())
 			}
 
 			s.log.Debugf(
@@ -739,7 +778,7 @@ func (s *commitLogSource) newReadCommitLogPredBasedOnAvailableSnapshotFiles(
 func (s *commitLogSource) newReadCommitLogPred(
 	ns namespace.Metadata,
 	minimumMostRecentSnapshotTimeByBlock map[xtime.UnixNano]time.Time,
-) func(f commitlog.File) bool {
+) commitlog.FileFilterPredicate {
 	var (
 		rOpts                            = ns.Options().RetentionOptions()
 		blockSize                        = rOpts.BlockSize()
@@ -892,7 +931,7 @@ func (s *commitLogSource) startM3TSZEncodingWorker(
 func (s *commitLogSource) shouldEncodeForData(
 	unmerged []shardData,
 	dataBlockSize time.Duration,
-	series commitlog.Series,
+	series ts.Series,
 	timestamp time.Time,
 ) bool {
 	// Check if the shard number is higher the amount of space we pre-allocated.
@@ -1193,9 +1232,10 @@ func (s *commitLogSource) mergeSeries(
 				// Should never happen because we would have called
 				// Blocks.RemoveBlockAt() above.
 				iOpts := s.opts.CommitLogOptions().InstrumentOptions()
-				invariantLogger := instrument.EmitInvariantViolationAndGetLogger(iOpts)
-				invariantLogger.Errorf(
-					"tried to merge block that should have been removed, blockStart: %d", startNano)
+				instrument.EmitAndLogInvariantViolation(iOpts, func(l xlog.Logger) {
+					l.Errorf(
+						"tried to merge block that should have been removed, blockStart: %d", startNano)
+				})
 				continue
 			}
 
@@ -1250,7 +1290,7 @@ func (s *commitLogSource) AvailableIndex(
 	ns namespace.Metadata,
 	shardsTimeRanges result.ShardTimeRanges,
 	runOpts bootstrap.RunOptions,
-) result.ShardTimeRanges {
+) (result.ShardTimeRanges, error) {
 	return s.availability(ns, shardsTimeRanges, runOpts)
 }
 
@@ -1268,9 +1308,13 @@ func (s *commitLogSource) ReadIndex(
 	}
 
 	var (
-		fsOpts         = s.opts.CommitLogOptions().FilesystemOptions()
-		filePathPrefix = fsOpts.FilePathPrefix()
+		// Emit bootstrapping gauge for duration of ReadIndex
+		doneReadingIndex       = s.metrics.index.emitBootstrapping()
+		encounteredCorruptData = false
+		fsOpts                 = s.opts.CommitLogOptions().FilesystemOptions()
+		filePathPrefix         = fsOpts.FilePathPrefix()
 	)
+	defer doneReadingIndex()
 
 	// Determine which snapshot files are available.
 	snapshotFilesByShard, err := s.snapshotFilesByShard(
@@ -1341,10 +1385,15 @@ func (s *commitLogSource) ReadIndex(
 
 	// Next, read all of the data from the commit log files that wasn't covered
 	// by the snapshot files.
-	iter, err := s.newIteratorFn(iterOpts)
+	iter, corruptFiles, err := s.newIteratorFn(iterOpts)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create commit log iterator: %v", err)
 	}
+	if len(corruptFiles) > 0 {
+		s.logAndEmitCorruptFiles(corruptFiles, false)
+		encounteredCorruptData = true
+	}
+
 	defer iter.Close()
 
 	for iter.Next() {
@@ -1353,6 +1402,17 @@ func (s *commitLogSource) ReadIndex(
 		s.maybeAddToIndex(
 			series.ID, series.Tags, series.Shard, highestShard, dp.Timestamp, bootstrapRangesByShard,
 			indexResults, indexOptions, indexBlockSize, resultOptions)
+	}
+
+	if iterErr := iter.Err(); iterErr != nil {
+		// Log the error and mark that we encountered corrupt data, but don't
+		// return the error because we want to give the peers bootstrapper the
+		// opportunity to repair the data instead of failing the bootstrap
+		// altogether.
+		s.log.Errorf(
+			"error in commitlog iterator: %v", iterErr)
+		encounteredCorruptData = true
+		s.metrics.index.corruptCommitlogFile.Inc(1)
 	}
 
 	// If all successful then we mark each index block as fulfilled
@@ -1380,7 +1440,42 @@ func (s *commitLogSource) ReadIndex(
 		}
 	}
 
+	shouldReturnUnfulfilled, err := s.shouldReturnUnfulfilled(
+		encounteredCorruptData, ns, shardsTimeRanges, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	if shouldReturnUnfulfilled {
+		indexResult.SetUnfulfilled(shardsTimeRanges)
+	}
 	return indexResult, nil
+}
+
+// If we encountered any corrupt data and there is a possibility of the
+// peers bootstrapper being able to correct it, we want to mark the entire range
+// as unfulfilled so the peers bootstrapper can attempt a repair, but keep
+// the data we read from the commit log as well in case the peers
+// bootstrapper is unable to satisfy the bootstrap because all peers are
+// down or if the commitlog contained data that the peers do not have.
+func (s commitLogSource) shouldReturnUnfulfilled(
+	encounteredCorruptData bool,
+	ns namespace.Metadata,
+	shardsTimeRanges result.ShardTimeRanges,
+	opts bootstrap.RunOptions,
+) (bool, error) {
+	if !s.opts.ReturnUnfulfilledForCorruptCommitlogFiles() {
+		return false, nil
+	}
+
+	if !encounteredCorruptData {
+		return false, nil
+	}
+
+	areShardsReplicated := s.areShardsReplicated(
+		ns, shardsTimeRanges, opts)
+
+	return areShardsReplicated, nil
 }
 
 func (s commitLogSource) maybeAddToIndex(
@@ -1424,6 +1519,20 @@ func (s commitLogSource) maybeAddToIndex(
 	return err
 }
 
+func (s *commitLogSource) logAndEmitCorruptFiles(
+	corruptFiles []commitlog.ErrorWithPath, isData bool) {
+	for _, f := range corruptFiles {
+		s.log.
+			Errorf(
+				"opting to skip commit log due to corruption: %s", f.Error())
+		if isData {
+			s.metrics.data.corruptCommitlogFile.Inc(1)
+		} else {
+			s.metrics.index.corruptCommitlogFile.Inc(1)
+		}
+	}
+}
+
 // The commitlog bootstrapper determines availability primarily by checking if the
 // origin host has ever reached the "Available" state for the shard that is being
 // bootstrapped. If not, then it can't provide data for that shard because it doesn't
@@ -1432,7 +1541,7 @@ func (s *commitLogSource) availability(
 	ns namespace.Metadata,
 	shardsTimeRanges result.ShardTimeRanges,
 	runOpts bootstrap.RunOptions,
-) result.ShardTimeRanges {
+) (result.ShardTimeRanges, error) {
 	var (
 		topoState                = runOpts.InitialTopologyState()
 		availableShardTimeRanges = result.ShardTimeRanges{}
@@ -1449,13 +1558,12 @@ func (s *commitLogSource) availability(
 
 		originHostShardState, ok := hostShardStates[topology.HostID(topoState.Origin.ID())]
 		if !ok {
-			// TODO(rartoul): Make this a hard error once we refactor the interface to support
-			// returning errors.
+			errMsg := fmt.Sprintf("initial topology state does not contain shard state for origin node and shard: %d", shardIDUint)
 			iOpts := s.opts.CommitLogOptions().InstrumentOptions()
-			invariantLogger := instrument.EmitInvariantViolationAndGetLogger(iOpts)
-			invariantLogger.Errorf(
-				"initial topology state does not contain shard state for origin node and shard: %d", shardIDUint)
-			continue
+			instrument.EmitAndLogInvariantViolation(iOpts, func(l xlog.Logger) {
+				l.Error(errMsg)
+			})
+			return nil, errors.New(errMsg)
 		}
 
 		originShardState := originHostShardState.ShardState
@@ -1484,14 +1592,31 @@ func (s *commitLogSource) availability(
 		case shard.Unknown:
 			fallthrough
 		default:
-			// TODO(rartoul): Make this a hard error once we refactor the interface to support
-			// returning errors.
-			s.log.Errorf("unknown shard state: %v", originShardState)
-			return result.ShardTimeRanges{}
+			return result.ShardTimeRanges{}, fmt.Errorf("unknown shard state: %v", originShardState)
 		}
 	}
 
-	return availableShardTimeRanges
+	return availableShardTimeRanges, nil
+}
+
+func (s *commitLogSource) areShardsReplicated(
+	ns namespace.Metadata,
+	shardsTimeRanges result.ShardTimeRanges,
+	runOpts bootstrap.RunOptions,
+) bool {
+	var (
+		initialTopologyState = runOpts.InitialTopologyState()
+		majorityReplicas     = initialTopologyState.MajorityReplicas
+	)
+
+	// In any situation where we could actually stream data from our peers
+	// the replication factor would be 2 or larger which means that the
+	// value of majorityReplicas would be 2 or larger also. This heuristic can
+	// only be used to infer whether the replication factor is 1 or larger, but
+	// cannot be used to determine what the actual replication factor is in all
+	// situations because it can be ambiguous. For example, both R.F 2 and 3 will
+	// have majority replica values of 2.
+	return majorityReplicas > 1
 }
 
 func newReadSeriesPredicate(ns namespace.Metadata) commitlog.SeriesFilterPredicate {
@@ -1517,7 +1642,7 @@ type metadataAndEncodersByTime struct {
 // encoderArg contains all the information a worker go-routine needs to encode
 // a data point as M3TSZ
 type encoderArg struct {
-	series     commitlog.Series
+	series     ts.Series
 	dp         ts.Datapoint
 	unit       xtime.Unit
 	annotation ts.Annotation
@@ -1556,5 +1681,53 @@ func newIOReadersFromEncodersAndBlock(
 func (ir ioReaders) close() {
 	for _, r := range ir {
 		r.(xio.SegmentReader).Finalize()
+	}
+}
+
+type commitLogSourceDataAndIndexMetrics struct {
+	data  commitLogSourceMetrics
+	index commitLogSourceMetrics
+}
+
+func newCommitLogSourceDataAndIndexMetrics(scope tally.Scope) commitLogSourceDataAndIndexMetrics {
+	return commitLogSourceDataAndIndexMetrics{
+		data: newCommitLogSourceMetrics(scope.Tagged(map[string]string{
+			"source_type": "data",
+		})),
+		index: newCommitLogSourceMetrics(scope.Tagged(map[string]string{
+			"source_type": "index",
+		})),
+	}
+}
+
+type commitLogSourceMetrics struct {
+	corruptCommitlogFile tally.Counter
+	bootstrapping        tally.Gauge
+}
+
+type gaugeLoopCloserFn func()
+
+func (m commitLogSourceMetrics) emitBootstrapping() gaugeLoopCloserFn {
+	doneCh := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-doneCh:
+				m.bootstrapping.Update(0)
+				return
+			default:
+				m.bootstrapping.Update(1)
+				time.Sleep(time.Second)
+			}
+		}
+	}()
+
+	return func() { close(doneCh) }
+}
+
+func newCommitLogSourceMetrics(scope tally.Scope) commitLogSourceMetrics {
+	return commitLogSourceMetrics{
+		corruptCommitlogFile: scope.SubScope("commitlog").Counter("corrupt"),
+		bootstrapping:        scope.SubScope("status").Gauge("bootstrapping"),
 	}
 }

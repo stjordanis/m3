@@ -21,10 +21,10 @@
 package topology
 
 import (
+	"github.com/m3db/m3/src/cluster/client"
+	"github.com/m3db/m3/src/cluster/services"
+	"github.com/m3db/m3/src/cluster/shard"
 	"github.com/m3db/m3/src/dbnode/sharding"
-	"github.com/m3db/m3cluster/client"
-	"github.com/m3db/m3cluster/services"
-	"github.com/m3db/m3cluster/shard"
 	"github.com/m3db/m3x/ident"
 	"github.com/m3db/m3x/instrument"
 )
@@ -208,6 +208,13 @@ type DynamicOptions interface {
 
 	// HashGen returns HashGen function
 	HashGen() sharding.HashGen
+}
+
+// MapProvider is an interface that can provide
+// a topology map.
+type MapProvider interface {
+	// TopologyMap returns a topology map.
+	TopologyMap() (Map, error)
 }
 
 // StateSnapshot represents a snapshot of the state of the topology at a

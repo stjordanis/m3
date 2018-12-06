@@ -24,6 +24,7 @@ import (
 	"context"
 	goerrors "errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -35,24 +36,42 @@ import (
 	"github.com/m3db/m3/src/query/storage"
 	"github.com/m3db/m3/src/query/ts"
 	"github.com/m3db/m3x/ident"
-	"github.com/m3db/m3x/pool"
 	xsync "github.com/m3db/m3x/sync"
 )
 
 var (
-	errNoLocalClustersFulfillsQuery = goerrors.New("no clusters can fulfill query")
+	errNoNamespacesConfigured = goerrors.New("no namespaces configured")
+)
+
+type queryFanoutType uint
+
+const (
+	namespaceCoversAllQueryRange queryFanoutType = iota
+	namespaceCoversPartialQueryRange
 )
 
 type m3storage struct {
+	tagOptions      models.TagOptions
 	clusters        Clusters
-	readWorkerPool  pool.ObjectPool
+	readWorkerPool  xsync.PooledWorkerPool
 	writeWorkerPool xsync.PooledWorkerPool
+	nowFn           func() time.Time
 }
 
 // NewStorage creates a new local m3storage instance.
-// TODO: Consider combining readWorkerPool and writeWorkerPool
-func NewStorage(clusters Clusters, workerPool pool.ObjectPool, writeWorkerPool xsync.PooledWorkerPool) Storage {
-	return &m3storage{clusters: clusters, readWorkerPool: workerPool, writeWorkerPool: writeWorkerPool}
+func NewStorage(
+	clusters Clusters,
+	readWorkerPool xsync.PooledWorkerPool,
+	writeWorkerPool xsync.PooledWorkerPool,
+	tagOptions models.TagOptions,
+) Storage {
+	return &m3storage{
+		tagOptions:      tagOptions,
+		clusters:        clusters,
+		readWorkerPool:  readWorkerPool,
+		writeWorkerPool: writeWorkerPool,
+		nowFn:           time.Now,
+	}
 }
 
 func (s *m3storage) Fetch(
@@ -60,13 +79,13 @@ func (s *m3storage) Fetch(
 	query *storage.FetchQuery,
 	options *storage.FetchOptions,
 ) (*storage.FetchResult, error) {
-	raw, cleanup, err := s.FetchRaw(ctx, query, options)
+	raw, cleanup, err := s.FetchCompressed(ctx, query, options)
 	defer cleanup()
 	if err != nil {
 		return nil, err
 	}
 
-	return storage.SeriesIteratorsToFetchResult(raw, s.readWorkerPool)
+	return storage.SeriesIteratorsToFetchResult(raw, s.readWorkerPool, false, s.tagOptions)
 }
 
 func (s *m3storage) FetchBlocks(
@@ -82,7 +101,7 @@ func (s *m3storage) FetchBlocks(
 	return storage.FetchResultToBlockResult(fetchResult, query)
 }
 
-func (s *m3storage) FetchRaw(
+func (s *m3storage) FetchCompressed(
 	ctx context.Context,
 	query *storage.FetchQuery,
 	options *storage.FetchOptions,
@@ -91,8 +110,6 @@ func (s *m3storage) FetchRaw(
 	select {
 	case <-ctx.Done():
 		return nil, noop, ctx.Err()
-	case <-options.KillChan:
-		return nil, noop, errors.ErrQueryInterrupted
 	default:
 	}
 
@@ -105,25 +122,27 @@ func (s *m3storage) FetchRaw(
 	// cluster that can completely fulfill this range and then prefer the
 	// highest resolution (most fine grained) results.
 	// This needs to be optimized, however this is a start.
+	fanout, namespaces, err := s.resolveClusterNamespacesForQuery(query.Start, query.End)
+	if err != nil {
+		return nil, noop, err
+	}
+
 	var (
-		opts       = storage.FetchOptionsToM3Options(options, query)
-		namespaces = s.clusters.ClusterNamespaces()
-		now        = time.Now()
-		fetches    = 0
-		result     multiFetchResult
-		wg         sync.WaitGroup
+		opts = storage.FetchOptionsToM3Options(options, query)
+		wg   sync.WaitGroup
 	)
+	if len(namespaces) == 0 {
+		return nil, noop, errNoNamespacesConfigured
+	}
+
+	pools, err := namespaces[0].Session().IteratorPools()
+	if err != nil {
+		return nil, noop, fmt.Errorf("unable to retrieve iterator pools: %v", err)
+	}
+
+	result := newMultiFetchResult(fanout, pools)
 	for _, namespace := range namespaces {
-		namespace := namespace // Capture var
-
-		clusterStart := now.Add(-1 * namespace.Options().Attributes().Retention)
-
-		// Only include if cluster can completely fulfill the range
-		if clusterStart.After(query.Start) {
-			continue
-		}
-
-		fetches++
+		namespace := namespace // Capture var)
 
 		wg.Add(1)
 		go func() {
@@ -132,21 +151,27 @@ func (s *m3storage) FetchRaw(
 			iters, _, err := session.FetchTagged(ns, m3query, opts)
 			// Ignore error from getting iterator pools, since operation
 			// will not be dramatically impacted if pools is nil
-			pools, _ := session.IteratorPools()
-			result.setPools(pools)
-			result.add(namespace.Options().Attributes(), iters, err)
+			result.Add(namespace.Options().Attributes(), iters, err)
 			wg.Done()
 		}()
 	}
-	if fetches == 0 {
-		return nil, noop, errNoLocalClustersFulfillsQuery
-	}
+
 	wg.Wait()
-	if err := result.err.FinalError(); err != nil {
+
+	// Check if the query was interrupted.
+	select {
+	case <-ctx.Done():
+		return nil, noop, ctx.Err()
+	default:
+	}
+
+	iters, err := result.FinalResult()
+	if err != nil {
+		result.Close()
 		return nil, noop, err
 	}
 
-	return result.iterators, result.close, nil
+	return iters, result.Close, nil
 }
 
 func (s *m3storage) FetchTags(
@@ -154,56 +179,80 @@ func (s *m3storage) FetchTags(
 	query *storage.FetchQuery,
 	options *storage.FetchOptions,
 ) (*storage.SearchResults, error) {
+	tagResult, cleanup, err := s.SearchCompressed(ctx, query, options)
+	defer cleanup()
+	if err != nil {
+		return nil, err
+	}
+
+	metrics := make(models.Metrics, len(tagResult))
+	for i, result := range tagResult {
+		m, err := storage.FromM3IdentToMetric(result.ID, result.Iter, s.tagOptions)
+		if err != nil {
+			return nil, err
+		}
+
+		metrics[i] = m
+	}
+
+	return &storage.SearchResults{
+		Metrics: metrics,
+	}, nil
+}
+
+func (s *m3storage) CompleteTags(
+	_ context.Context,
+	_ *storage.CompleteTagsQuery,
+	_ *storage.FetchOptions,
+) (*storage.CompleteTagsResult, error) {
+	return nil, errors.ErrNotImplemented
+}
+
+func (s *m3storage) SearchCompressed(
+	ctx context.Context,
+	query *storage.FetchQuery,
+	options *storage.FetchOptions,
+) ([]MultiTagResult, Cleanup, error) {
 	// Check if the query was interrupted.
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-options.KillChan:
-		return nil, errors.ErrQueryInterrupted
+		return nil, nil, ctx.Err()
 	default:
 	}
 
 	m3query, err := storage.FetchQueryToM3Query(query)
 	if err != nil {
-		return nil, err
+		return nil, noop, err
 	}
 
 	var (
-		opts       = storage.FetchOptionsToM3Options(options, query)
+		m3opts     = storage.FetchOptionsToM3Options(options, query)
 		namespaces = s.clusters.ClusterNamespaces()
-		now        = time.Now()
-		fetches    = 0
-		result     multiFetchTagsResult
+		result     = NewMultiFetchTagsResult()
 		wg         sync.WaitGroup
 	)
+
+	if len(namespaces) == 0 {
+		return nil, noop, errNoNamespacesConfigured
+	}
+
+	wg.Add(len(namespaces))
 	for _, namespace := range namespaces {
 		namespace := namespace // Capture var
 
-		clusterStart := now.Add(-1 * namespace.Options().Attributes().Retention)
-
-		// Only include if cluster can completely fulfill the range
-		if clusterStart.After(query.Start) {
-			continue
-		}
-
-		fetches++
-
-		wg.Add(1)
 		go func() {
-			result.add(s.fetchTags(namespace, m3query, opts))
+			session := namespace.Session()
+			namespaceID := namespace.NamespaceID()
+			iter, _, err := session.FetchTaggedIDs(namespaceID, m3query, m3opts)
+			result.Add(iter, err)
 			wg.Done()
 		}()
 	}
 
-	if fetches == 0 {
-		return nil, errNoLocalClustersFulfillsQuery
-	}
-
 	wg.Wait()
-	if err := result.err.FinalError(); err != nil {
-		return nil, err
-	}
-	return result.result, nil
+
+	tagResult, err := result.FinalResult()
+	return tagResult, result.Close, err
 }
 
 func (s *m3storage) fetchTags(
@@ -223,7 +272,7 @@ func (s *m3storage) fetchTags(
 	var metrics models.Metrics
 	for iter.Next() {
 		_, id, it := iter.Current()
-		m, err := storage.FromM3IdentToMetric(id, it)
+		m, err := storage.FromM3IdentToMetric(id, it, s.tagOptions)
 		if err != nil {
 			return nil, err
 		}
@@ -256,12 +305,24 @@ func (s *m3storage) Write(
 		return errors.ErrNilWriteQuery
 	}
 
-	id := query.Tags.ID()
-	// TODO: Consider caching id -> identID
-	identID := ident.StringID(id)
+	var (
+		// TODO: Pool this once an ident pool is setup. We will have
+		// to stop calling NoFinalize() below if we do that.
+		buf   = make([]byte, 0, query.Tags.IDLen())
+		idBuf = query.Tags.IDMarshalTo(buf)
+		id    = ident.BytesID(idBuf)
+	)
 	// Set id to NoFinalize to avoid cloning it in write operations
-	identID.NoFinalize()
+	id.NoFinalize()
 	tagIterator := storage.TagsToIdentTagIterator(query.Tags)
+
+	if len(query.Datapoints) == 1 {
+		// Special case single datapoint because it is common and we
+		// can avoid the overhead of a waitgroup, goroutine, multierr,
+		// iterator duplication etc.
+		return s.writeSingle(
+			ctx, query, query.Datapoints[0], id, tagIterator)
+	}
 
 	var (
 		wg       sync.WaitGroup
@@ -274,7 +335,7 @@ func (s *m3storage) Write(
 		datapoint := datapoint
 		wg.Add(1)
 		s.writeWorkerPool.Go(func() {
-			if err := s.writeSingle(ctx, query, datapoint, identID, tagIter); err != nil {
+			if err := s.writeSingle(ctx, query, datapoint, id, tagIter); err != nil {
 				multiErr.add(err)
 			}
 
@@ -284,7 +345,7 @@ func (s *m3storage) Write(
 	}
 
 	wg.Wait()
-	return multiErr.finalError()
+	return multiErr.lastError()
 }
 
 func (s *m3storage) Type() storage.Type {
@@ -335,4 +396,151 @@ func (s *m3storage) writeSingle(
 	session := namespace.Session()
 	return session.WriteTagged(namespaceID, identID, iterator,
 		datapoint.Timestamp, datapoint.Value, query.Unit, query.Annotation)
+}
+
+// resolveClusterNamespacesForQuery returns the namespaces that need to be
+// fanned out to depending on the query time and the namespaces configured.
+func (s *m3storage) resolveClusterNamespacesForQuery(
+	start time.Time,
+	end time.Time,
+) (queryFanoutType, ClusterNamespaces, error) {
+	now := s.nowFn()
+
+	unaggregated := s.clusters.UnaggregatedClusterNamespace()
+	unaggregatedRetention := unaggregated.Options().Attributes().Retention
+	unaggregatedStart := now.Add(-1 * unaggregatedRetention)
+	if unaggregatedStart.Before(start) || unaggregatedStart.Equal(start) {
+		// Highest resolution is unaggregated, return if it can fulfill it
+		return namespaceCoversAllQueryRange, ClusterNamespaces{unaggregated}, nil
+	}
+
+	// First determine if any aggregated clusters span the whole query range, if
+	// so that's the most optimal strategy, choose the most granular resolution
+	// that can and fan out to any partial aggregated namespaces that may holder
+	// even more granular resolutions
+	var r reusedAggregatedNamespaceSlices
+	r = s.aggregatedNamespaces(r, func(namespace ClusterNamespace) bool {
+		// Include only if can fulfill the entire time range of the query
+		clusterStart := now.Add(-1 * namespace.Options().Attributes().Retention)
+		return clusterStart.Before(start) || clusterStart.Equal(start)
+	})
+
+	if len(r.completeAggregated) > 0 {
+		// Return the most granular completed aggregated namespace and
+		// any potentially more granular partial aggregated namespaces
+		sort.Stable(ClusterNamespacesByResolutionAsc(r.completeAggregated))
+
+		// Take most granular complete aggregated namespace
+		result := r.completeAggregated[:1]
+		completedAttrs := result[0].Options().Attributes()
+
+		// Take any finer grain partially aggregated namespaces that
+		// may contain a matching metric
+		for _, n := range r.partialAggregated {
+			if n.Options().Attributes().Resolution >= completedAttrs.Resolution {
+				// Not more granular
+				continue
+			}
+			result = append(result, n)
+		}
+
+		return namespaceCoversAllQueryRange, result, nil
+	}
+
+	// No complete aggregated namespaces can definitely fulfill the query,
+	// so take the longest retention completed aggregated namespace to return
+	// as much data as possible, along with any partially aggregated namespaces
+	// that have either same retention and lower resolution or longer retention
+	// than the complete aggregated namespace
+	r = s.aggregatedNamespaces(r, nil)
+
+	if len(r.completeAggregated) == 0 {
+		// Absolutely no complete aggregated namespaces, need to fanout to all
+		// partial aggregated namespaces as well as the unaggregated cluster
+		// as we have no idea who has the longest retention
+		result := append(r.partialAggregated, unaggregated)
+		return namespaceCoversPartialQueryRange, result, nil
+	}
+
+	// Return the longest retention aggregated namespace and
+	// any potentially more granular or longer retention partial
+	// aggregated namespaces
+	sort.Stable(sort.Reverse(ClusterNamespacesByRetentionAsc(r.completeAggregated)))
+
+	// Take longest retention complete aggregated namespace or the unaggregated
+	// cluster if that is longer than the longest aggregated namespace
+	result := r.completeAggregated[:1]
+	completedAttrs := result[0].Options().Attributes()
+	if completedAttrs.Retention <= unaggregatedRetention {
+		// If the longest aggregated cluster for some reason has lower retention
+		// than the unaggregated cluster then we prefer the unaggregated cluster
+		// as it has a complete data set and is always the most granular
+		result[0] = unaggregated
+		completedAttrs = unaggregated.Options().Attributes()
+	}
+
+	// Take any partially aggregated namespaces with longer retention or
+	// same retention with more granular resolution that may contain
+	// a matching metric
+	for _, n := range r.partialAggregated {
+		if n.Options().Attributes().Retention > completedAttrs.Retention {
+			// Higher retention
+			result = append(result, n)
+			continue
+		}
+		if n.Options().Attributes().Retention == completedAttrs.Retention &&
+			n.Options().Attributes().Resolution < completedAttrs.Resolution {
+			// Same retention but more granular resolution
+			result = append(result, n)
+			continue
+		}
+	}
+
+	return namespaceCoversPartialQueryRange, result, nil
+}
+
+type reusedAggregatedNamespaceSlices struct {
+	completeAggregated []ClusterNamespace
+	partialAggregated  []ClusterNamespace
+}
+
+func (s *m3storage) aggregatedNamespaces(
+	slices reusedAggregatedNamespaceSlices,
+	filter func(ClusterNamespace) bool,
+) reusedAggregatedNamespaceSlices {
+	all := s.clusters.ClusterNamespaces()
+
+	// Reset reused slices as necessary
+	if slices.completeAggregated == nil {
+		slices.completeAggregated = make([]ClusterNamespace, 0, len(all))
+	}
+	slices.completeAggregated = slices.completeAggregated[:0]
+	if slices.partialAggregated == nil {
+		slices.partialAggregated = make([]ClusterNamespace, 0, len(all))
+	}
+	slices.partialAggregated = slices.partialAggregated[:0]
+
+	for _, namespace := range all {
+		opts := namespace.Options()
+		if opts.Attributes().MetricsType != storage.AggregatedMetricsType {
+			// Not an aggregated cluster
+			continue
+		}
+
+		if filter != nil && !filter(namespace) {
+			continue
+		}
+
+		downsampleOpts, err := opts.DownsampleOptions()
+		if err != nil || !downsampleOpts.All {
+			// Cluster does not contain all data, include as part of fan out
+			// but separate from
+			slices.partialAggregated = append(slices.partialAggregated, namespace)
+			continue
+		}
+
+		slices.completeAggregated = append(slices.completeAggregated, namespace)
+	}
+
+	return slices
 }

@@ -32,6 +32,8 @@ import (
 	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/native"
 	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/remote"
 	"github.com/m3db/m3/src/query/executor"
+	"github.com/m3db/m3/src/query/models"
+	"github.com/m3db/m3/src/query/storage"
 	"github.com/m3db/m3/src/query/test/m3"
 	"github.com/m3db/m3/src/query/util/logging"
 
@@ -41,6 +43,15 @@ import (
 	"github.com/uber-go/tally"
 )
 
+func makeTagOptions() models.TagOptions {
+	return models.NewTagOptions().SetMetricName([]byte("some_name"))
+}
+
+func setupHandler(store storage.Storage) (*Handler, error) {
+	return NewHandler(store, makeTagOptions(), nil, executor.NewEngine(store, tally.NewTestScope("test", nil)), nil, nil,
+		config.Configuration{}, nil, tally.NewTestScope("", nil))
+}
+
 func TestPromRemoteReadGet(t *testing.T) {
 	logging.InitWithCores(nil)
 
@@ -49,12 +60,11 @@ func TestPromRemoteReadGet(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	storage, _ := m3.NewStorageAndSession(t, ctrl)
 
-	h, err := NewHandler(storage, nil, executor.NewEngine(storage), nil,
-		config.Configuration{}, nil, tally.NewTestScope("", nil))
+	h, err := setupHandler(storage)
 	require.NoError(t, err, "unable to setup handler")
 	err = h.RegisterRoutes()
 	require.NoError(t, err, "unable to register routes")
-	h.Router.ServeHTTP(res, req)
+	h.Router().ServeHTTP(res, req)
 	require.Equal(t, res.Code, http.StatusMethodNotAllowed, "GET method not defined")
 }
 
@@ -66,12 +76,11 @@ func TestPromRemoteReadPost(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	storage, _ := m3.NewStorageAndSession(t, ctrl)
 
-	h, err := NewHandler(storage, nil, executor.NewEngine(storage), nil,
-		config.Configuration{}, nil, tally.NewTestScope("", nil))
+	h, err := setupHandler(storage)
 	require.NoError(t, err, "unable to setup handler")
 	err = h.RegisterRoutes()
 	require.NoError(t, err, "unable to register routes")
-	h.Router.ServeHTTP(res, req)
+	h.Router().ServeHTTP(res, req)
 	require.Equal(t, res.Code, http.StatusBadRequest, "Empty request")
 }
 
@@ -83,11 +92,10 @@ func TestPromNativeReadGet(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	storage, _ := m3.NewStorageAndSession(t, ctrl)
 
-	h, err := NewHandler(storage, nil, executor.NewEngine(storage), nil,
-		config.Configuration{}, nil, tally.NewTestScope("", nil))
+	h, err := setupHandler(storage)
 	require.NoError(t, err, "unable to setup handler")
 	h.RegisterRoutes()
-	h.Router.ServeHTTP(res, req)
+	h.Router().ServeHTTP(res, req)
 	require.Equal(t, res.Code, http.StatusBadRequest, "Empty request")
 }
 
@@ -99,11 +107,10 @@ func TestPromNativeReadPost(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	storage, _ := m3.NewStorageAndSession(t, ctrl)
 
-	h, err := NewHandler(storage, nil, executor.NewEngine(storage), nil,
-		config.Configuration{}, nil, tally.NewTestScope("", nil))
+	h, err := setupHandler(storage)
 	require.NoError(t, err, "unable to setup handler")
 	h.RegisterRoutes()
-	h.Router.ServeHTTP(res, req)
+	h.Router().ServeHTTP(res, req)
 	require.Equal(t, res.Code, http.StatusMethodNotAllowed, "POST method not defined")
 }
 
@@ -115,11 +122,10 @@ func TestJSONWritePost(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	storage, _ := m3.NewStorageAndSession(t, ctrl)
 
-	h, err := NewHandler(storage, nil, executor.NewEngine(storage), nil,
-		config.Configuration{}, nil, tally.NewTestScope("", nil))
+	h, err := setupHandler(storage)
 	require.NoError(t, err, "unable to setup handler")
 	h.RegisterRoutes()
-	h.Router.ServeHTTP(res, req)
+	h.Router().ServeHTTP(res, req)
 	require.Equal(t, res.Code, http.StatusBadRequest, "Empty request")
 }
 
@@ -131,11 +137,10 @@ func TestRoutesGet(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	storage, _ := m3.NewStorageAndSession(t, ctrl)
 
-	h, err := NewHandler(storage, nil, executor.NewEngine(storage), nil,
-		config.Configuration{}, nil, tally.NewTestScope("", nil))
+	h, err := setupHandler(storage)
 	require.NoError(t, err, "unable to setup handler")
 	h.RegisterRoutes()
-	h.Router.ServeHTTP(res, req)
+	h.Router().ServeHTTP(res, req)
 
 	require.Equal(t, res.Code, http.StatusOK)
 
@@ -164,12 +169,11 @@ func TestHealthGet(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	storage, _ := m3.NewStorageAndSession(t, ctrl)
 
-	h, err := NewHandler(storage, nil, executor.NewEngine(storage), nil,
-		config.Configuration{}, nil, tally.NewTestScope("", nil))
+	h, err := setupHandler(storage)
 	require.NoError(t, err, "unable to setup handler")
 	h.RegisterRoutes()
 
-	h.Router.ServeHTTP(res, req)
+	h.Router().ServeHTTP(res, req)
 
 	require.Equal(t, res.Code, http.StatusOK)
 
@@ -184,4 +188,26 @@ func TestHealthGet(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.True(t, result > 0)
+}
+
+func TestCORSMiddleware(t *testing.T) {
+	logging.InitWithCores(nil)
+
+	ctrl := gomock.NewController(t)
+	s, _ := m3.NewStorageAndSession(t, ctrl)
+	h, err := setupHandler(s)
+	require.NoError(t, err, "unable to setup handler")
+
+	testRoute := "/foobar"
+	h.router.HandleFunc(testRoute, func(writer http.ResponseWriter, r *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+		writer.Write([]byte("hello!"))
+	})
+
+	req, _ := http.NewRequest("GET", testRoute, nil)
+	res := httptest.NewRecorder()
+	h.Router().ServeHTTP(res, req)
+
+	assert.Equal(t, "hello!", res.Body.String())
+	assert.Equal(t, "*", res.Header().Get("Access-Control-Allow-Origin"))
 }

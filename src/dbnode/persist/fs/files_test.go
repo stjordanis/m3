@@ -38,7 +38,9 @@ import (
 	"github.com/m3db/m3/src/dbnode/retention"
 	"github.com/m3db/m3/src/dbnode/storage/namespace"
 	"github.com/m3db/m3x/ident"
+	"github.com/m3db/m3x/instrument"
 
+	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -281,32 +283,126 @@ func TestTimeAndVolumeIndexFromFileSetFilename(t *testing.T) {
 	require.Equal(t, filesetPathFromTimeAndIndex("foo/bar", exp.t, exp.i, "data"), validName)
 }
 
-func TestFileExists(t *testing.T) {
-	dir := createTempDir(t)
-	defer os.RemoveAll(dir)
+func TestSnapshotMetadataFilePathFromIdentifierRoundTrip(t *testing.T) {
+	idUUID := uuid.Parse("bf58eb3e-0582-42ee-83b2-d098c206260e")
+	require.NotNil(t, idUUID)
 
-	shard := uint32(10)
-	start := time.Now()
-	shardDir := ShardDataDirPath(dir, testNs1ID, shard)
-	err := os.MkdirAll(shardDir, defaultNewDirectoryMode)
+	var (
+		prefix = "/var/lib/m3db"
+		id     = SnapshotMetadataIdentifier{
+			Index: 10,
+			UUID:  idUUID,
+		}
+	)
+
+	var (
+		expected = "/var/lib/m3db/snapshots/snapshot-bf58eb3e058242ee83b2d098c206260e-10-metadata.db"
+		actual   = snapshotMetadataFilePathFromIdentifier(prefix, id)
+	)
+	require.Equal(t, expected, actual)
+
+	idFromPath, err := snapshotMetadataIdentifierFromFilePath(expected)
+	require.NoError(t, err)
+	require.Equal(t, id, idFromPath)
+}
+
+func TestSnapshotMetadataCheckpointFilePathFromIdentifierRoundTrip(t *testing.T) {
+	idUUID := uuid.Parse("bf58eb3e-0582-42ee-83b2-d098c206260e")
+	require.NotNil(t, idUUID)
+
+	var (
+		prefix = "/var/lib/m3db"
+		id     = SnapshotMetadataIdentifier{
+			Index: 10,
+			UUID:  idUUID,
+		}
+	)
+
+	var (
+		expected = "/var/lib/m3db/snapshots/snapshot-bf58eb3e058242ee83b2d098c206260e-10-metadata-checkpoint.db"
+		actual   = snapshotMetadataCheckpointFilePathFromIdentifier(prefix, id)
+	)
+	require.Equal(t, expected, actual)
+
+	idFromPath, err := snapshotMetadataIdentifierFromFilePath(expected)
+	require.NoError(t, err)
+	require.Equal(t, id, idFromPath)
+}
+
+func TestSanitizedUUIDsCanBeParsed(t *testing.T) {
+	u := uuid.Parse("bf58eb3e-0582-42ee-83b2-d098c206260e")
+	require.NotNil(t, u)
+
+	parsedUUID, ok := parseUUID(sanitizeUUID(u))
+	require.True(t, ok)
+	require.Equal(t, u.String(), parsedUUID.String())
+}
+
+func TestFileExists(t *testing.T) {
+
+	var (
+		dir               = createTempDir(t)
+		shard             = uint32(10)
+		start             = time.Now()
+		shardDir          = ShardDataDirPath(dir, testNs1ID, shard)
+		checkpointFileBuf = make([]byte, CheckpointFileSizeBytes)
+		err               = os.MkdirAll(shardDir, defaultNewDirectoryMode)
+	)
+	defer os.RemoveAll(dir)
 	require.NoError(t, err)
 
 	infoFilePath := filesetPathFromTime(shardDir, start, infoFileSuffix)
-	createDataFile(t, shardDir, start, infoFileSuffix, nil)
+	createDataFile(t, shardDir, start, infoFileSuffix, checkpointFileBuf)
 	require.True(t, mustFileExists(t, infoFilePath))
 	exists, err := DataFileSetExistsAt(dir, testNs1ID, uint32(shard), start)
 	require.NoError(t, err)
 	require.False(t, exists)
 
 	checkpointFilePath := filesetPathFromTime(shardDir, start, checkpointFileSuffix)
-	createDataFile(t, shardDir, start, checkpointFileSuffix, nil)
-	require.True(t, mustFileExists(t, checkpointFilePath))
+	createDataFile(t, shardDir, start, checkpointFileSuffix, checkpointFileBuf)
 	exists, err = DataFileSetExistsAt(dir, testNs1ID, uint32(shard), start)
 	require.NoError(t, err)
 	require.True(t, exists)
 
+	exists, err = CompleteCheckpointFileExists(checkpointFilePath)
+	require.NoError(t, err)
+	require.True(t, exists)
+
+	_, err = FileExists(checkpointFilePath)
+	require.Error(t, err)
+
 	os.Remove(infoFilePath)
 	require.False(t, mustFileExists(t, infoFilePath))
+}
+
+func TestCompleteCheckpointFileExists(t *testing.T) {
+	var (
+		dir                = createTempDir(t)
+		shard              = uint32(10)
+		start              = time.Now()
+		shardDir           = ShardDataDirPath(dir, testNs1ID, shard)
+		checkpointFilePath = filesetPathFromTime(shardDir, start, checkpointFileSuffix)
+		err                = os.MkdirAll(shardDir, defaultNewDirectoryMode)
+
+		validCheckpointFileBuf   = make([]byte, CheckpointFileSizeBytes)
+		invalidCheckpointFileBuf = make([]byte, CheckpointFileSizeBytes+1)
+	)
+	defer os.RemoveAll(dir)
+	require.NoError(t, err)
+
+	createDataFile(t, shardDir, start, checkpointFileSuffix, invalidCheckpointFileBuf)
+	exists, err := CompleteCheckpointFileExists(checkpointFilePath)
+	require.NoError(t, err)
+	require.False(t, exists)
+
+	createDataFile(t, shardDir, start, checkpointFileSuffix, validCheckpointFileBuf)
+	exists, err = CompleteCheckpointFileExists(checkpointFilePath)
+	require.NoError(t, err)
+	require.True(t, exists)
+
+	exists, err = CompleteCheckpointFileExists("some-arbitrary-file")
+	require.Contains(t, err.Error(), instrument.InvariantViolatedMetricName)
+	require.False(t, exists)
 }
 
 func TestShardDirPath(t *testing.T) {
@@ -490,6 +586,125 @@ func TestNextSnapshotFileSetVolumeIndex(t *testing.T) {
 
 		writeOutTestSnapshot(t, dir, shard, blockStart, index)
 	}
+}
+
+// TestSortedSnapshotMetadataFiles tests the SortedSnapshotMetadataFiles function by writing out
+// a number of valid snapshot metadata files (along with their checkpoint files), as
+// well as one invalid / corrupt one, and then asserts that the correct number of valid
+// and corrupt files are returned.
+func TestSortedSnapshotMetadataFiles(t *testing.T) {
+	var (
+		dir            = createTempDir(t)
+		filePathPrefix = filepath.Join(dir, "")
+		opts           = testDefaultOpts.
+				SetFilePathPrefix(filePathPrefix)
+		commitlogIdentifier = []byte("commitlog_id")
+		numMetadataFiles    = 10
+	)
+	defer func() {
+		os.RemoveAll(dir)
+	}()
+
+	// Shoulld be no files before we write them out.
+	metadataFiles, errorsWithpaths, err := SortedSnapshotMetadataFiles(opts)
+	require.NoError(t, err)
+	require.Empty(t, errorsWithpaths)
+	require.Empty(t, metadataFiles)
+
+	// Write out a bunch of metadata files along with their corresponding checkpoints.
+	for i := 0; i < numMetadataFiles; i++ {
+		snapshotUUID := uuid.Parse("6645a373-bf82-42e7-84a6-f8452b137549")
+		require.NotNil(t, snapshotUUID)
+
+		snapshotMetadataIdentifier := SnapshotMetadataIdentifier{
+			Index: int64(i),
+			UUID:  snapshotUUID,
+		}
+
+		writer := NewSnapshotMetadataWriter(opts)
+		err := writer.Write(SnapshotMetadataWriteArgs{
+			ID:                  snapshotMetadataIdentifier,
+			CommitlogIdentifier: commitlogIdentifier,
+		})
+		require.NoError(t, err)
+
+		reader := NewSnapshotMetadataReader(opts)
+		snapshotMetadata, err := reader.Read(snapshotMetadataIdentifier)
+		require.NoError(t, err)
+
+		require.Equal(t, SnapshotMetadata{
+			ID:                  snapshotMetadataIdentifier,
+			CommitlogIdentifier: commitlogIdentifier,
+			MetadataFilePath: snapshotMetadataFilePathFromIdentifier(
+				filePathPrefix, snapshotMetadataIdentifier),
+			CheckpointFilePath: snapshotMetadataCheckpointFilePathFromIdentifier(
+				filePathPrefix, snapshotMetadataIdentifier),
+		}, snapshotMetadata)
+
+		// Corrupt the last file.
+		if i == numMetadataFiles-1 {
+			os.Remove(snapshotMetadataCheckpointFilePathFromIdentifier(
+				filePathPrefix, snapshotMetadataIdentifier))
+		}
+	}
+
+	metadataFiles, errorsWithpaths, err = SortedSnapshotMetadataFiles(opts)
+	require.NoError(t, err)
+	require.Len(t, errorsWithpaths, 1)
+	require.Len(t, metadataFiles, numMetadataFiles-1)
+
+	// Assert that they're sorted.
+	for i, file := range metadataFiles {
+		require.Equal(t, int64(i), file.ID.Index)
+	}
+}
+
+// TestNextSnapshotMetadataFileIndex tests the NextSnapshotMetadataFileIndex function by
+// writing out a number of SnapshotMetadata files and then ensuring that the NextSnapshotMetadataFileIndex
+// function returns the correct next index.
+func TestNextSnapshotMetadataFileIndex(t *testing.T) {
+	var (
+		dir            = createTempDir(t)
+		filePathPrefix = filepath.Join(dir, "")
+		opts           = testDefaultOpts.
+				SetFilePathPrefix(filePathPrefix)
+		commitlogIdentifier = []byte("commitlog_id")
+		numMetadataFiles    = 10
+	)
+	defer func() {
+		os.RemoveAll(dir)
+	}()
+
+	// Shoulld be no files before we write them out.
+	metadataFiles, errorsWithpaths, err := SortedSnapshotMetadataFiles(opts)
+	require.NoError(t, err)
+	require.Empty(t, errorsWithpaths)
+	require.Empty(t, metadataFiles)
+
+	writer := NewSnapshotMetadataWriter(opts)
+	// Write out a bunch of metadata files along with their corresponding checkpoints.
+	for i := 0; i < numMetadataFiles; i++ {
+		snapshotUUID := uuid.Parse("6645a373-bf82-42e7-84a6-f8452b137549")
+		require.NotNil(t, snapshotUUID)
+
+		snapshotMetadataIdentifier := SnapshotMetadataIdentifier{
+			Index: int64(i),
+			UUID:  snapshotUUID,
+		}
+
+		err := writer.Write(SnapshotMetadataWriteArgs{
+			ID:                  snapshotMetadataIdentifier,
+			CommitlogIdentifier: commitlogIdentifier,
+		})
+		require.NoError(t, err)
+	}
+
+	nextIdx, err := NextSnapshotMetadataFileIndex(opts)
+	require.NoError(t, err)
+	// Snapshot metadata file indices are zero-based so if we wrote out
+	// numMetadataFiles, then the last index should be numMetadataFiles-1
+	// and the next one should be numMetadataFiles.
+	require.Equal(t, int64(numMetadataFiles), nextIdx)
 }
 
 func TestNextIndexFileSetVolumeIndex(t *testing.T) {

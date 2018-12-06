@@ -36,6 +36,11 @@ type columnBlock struct {
 	seriesMeta []SeriesMeta
 }
 
+// Unconsolidated returns the unconsolidated version for the block
+func (c *columnBlock) Unconsolidated() (UnconsolidatedBlock, error) {
+	return nil, fmt.Errorf("unconsolidated view not supported for block, meta: %s", c.meta)
+}
+
 // Meta returns the metadata for the block
 func (c *columnBlock) Meta() Metadata {
 	return c.meta
@@ -59,6 +64,17 @@ func (c *columnBlock) StepIter() (StepIter, error) {
 // SeriesIter returns a SeriesIterator
 func (c *columnBlock) SeriesIter() (SeriesIter, error) {
 	return newColumnBlockSeriesIter(c.columns, c.meta, c.seriesMeta), nil
+}
+
+func (c *columnBlock) WithMetadata(
+	meta Metadata,
+	seriesMetas []SeriesMeta,
+) (Block, error) {
+	return &columnBlock{
+		columns:    c.columns,
+		meta:       meta,
+		seriesMeta: seriesMetas,
+	}, nil
 }
 
 // TODO: allow series iteration

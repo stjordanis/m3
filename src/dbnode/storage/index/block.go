@@ -37,13 +37,16 @@ import (
 	"github.com/m3db/m3x/context"
 	xerrors "github.com/m3db/m3x/errors"
 	"github.com/m3db/m3x/instrument"
+	xlog "github.com/m3db/m3x/log"
 	xtime "github.com/m3db/m3x/time"
 )
 
 var (
+	// ErrUnableToQueryBlockClosed is returned when querying closed block.
+	ErrUnableToQueryBlockClosed = errors.New("unable to query, index block is closed")
+
 	errUnableToWriteBlockClosed     = errors.New("unable to write, index block is closed")
 	errUnableToWriteBlockSealed     = errors.New("unable to write, index block is sealed")
-	errUnableToQueryBlockClosed     = errors.New("unable to query, index block is closed")
 	errUnableToBootstrapBlockClosed = errors.New("unable to bootstrap, block is closed")
 	errUnableToTickBlockClosed      = errors.New("unable to tick, block is closed")
 	errBlockAlreadyClosed           = errors.New("unable to close, block already closed")
@@ -235,7 +238,7 @@ func (b *block) Query(
 	b.RLock()
 	defer b.RUnlock()
 	if b.state == blockStateClosed {
-		return false, errUnableToQueryBlockClosed
+		return false, ErrUnableToQueryBlockClosed
 	}
 
 	exec, err := b.newExecutorFn()
@@ -252,12 +255,10 @@ func (b *block) Query(
 		return false, err
 	}
 
-	var (
-		size       = results.Size()
-		brokeEarly = false
-	)
-	execCloser := safeCloser{closable: exec}
+	size := results.Size()
+	limitedResults := false
 	iterCloser := safeCloser{closable: iter}
+	execCloser := safeCloser{closable: exec}
 
 	defer func() {
 		iterCloser.Close()
@@ -265,12 +266,13 @@ func (b *block) Query(
 	}()
 
 	for iter.Next() {
-		if opts.Limit > 0 && size >= opts.Limit {
-			brokeEarly = true
+		if opts.LimitExceeded(size) {
+			limitedResults = true
 			break
 		}
+
 		d := iter.Current()
-		_, size, err = results.Add(d)
+		_, size, err = results.AddDocument(d)
 		if err != nil {
 			return false, err
 		}
@@ -288,7 +290,7 @@ func (b *block) Query(
 		return false, err
 	}
 
-	exhaustive := !brokeEarly
+	exhaustive := !limitedResults
 	return exhaustive, nil
 }
 
@@ -527,26 +529,34 @@ func (b *block) writeBatchErrorInvalidState(state blockState) error {
 		return errUnableToWriteBlockSealed
 	default: // should never happen
 		err := fmt.Errorf(errUnableToWriteBlockUnknownStateFmtString, state)
-		instrument.EmitInvariantViolationAndGetLogger(b.opts.InstrumentOptions()).Errorf(err.Error())
+		instrument.EmitAndLogInvariantViolation(b.opts.InstrumentOptions(), func(l xlog.Logger) {
+			l.Errorf(err.Error())
+		})
 		return err
 	}
 }
 
 func (b *block) unknownWriteBatchInvariantError(err error) error {
 	wrappedErr := fmt.Errorf("unexpected non-BatchPartialError from m3ninx InsertBatch: %v", err)
-	instrument.EmitInvariantViolationAndGetLogger(b.opts.InstrumentOptions()).Errorf(wrappedErr.Error())
+	instrument.EmitAndLogInvariantViolation(b.opts.InstrumentOptions(), func(l xlog.Logger) {
+		l.Errorf(wrappedErr.Error())
+	})
 	return wrappedErr
 }
 
 func (b *block) bootstrappingSealedMutableSegmentInvariant(err error) error {
 	wrapped := fmt.Errorf("internal error: bootstrapping a mutable segment already marked sealed: %v", err)
-	instrument.EmitInvariantViolationAndGetLogger(b.opts.InstrumentOptions()).Errorf(wrapped.Error())
+	instrument.EmitAndLogInvariantViolation(b.opts.InstrumentOptions(), func(l xlog.Logger) {
+		l.Errorf(wrapped.Error())
+	})
 	return wrapped
 }
 
 func (b *block) openBlockHasNilActiveSegmentInvariantErrorWithRLock() error {
 	err := fmt.Errorf("internal error: block has open block state [%v] has nil active segment", b.state)
-	instrument.EmitInvariantViolationAndGetLogger(b.opts.InstrumentOptions()).Errorf(err.Error())
+	instrument.EmitAndLogInvariantViolation(b.opts.InstrumentOptions(), func(l xlog.Logger) {
+		l.Errorf(err.Error())
+	})
 	return err
 }
 

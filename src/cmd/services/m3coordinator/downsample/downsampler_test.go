@@ -21,23 +21,23 @@
 package downsample
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
-	"github.com/m3db/m3/src/dbnode/serialize"
+	"github.com/m3db/m3/src/cluster/kv/mem"
+	"github.com/m3db/m3/src/metrics/aggregation"
+	"github.com/m3db/m3/src/metrics/generated/proto/rulepb"
+	"github.com/m3db/m3/src/metrics/matcher"
+	"github.com/m3db/m3/src/metrics/metric/id"
+	"github.com/m3db/m3/src/metrics/policy"
+	"github.com/m3db/m3/src/metrics/rules"
+	ruleskv "github.com/m3db/m3/src/metrics/rules/store/kv"
+	"github.com/m3db/m3/src/metrics/rules/view"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/storage"
 	"github.com/m3db/m3/src/query/storage/mock"
-	"github.com/m3db/m3cluster/kv/mem"
-	"github.com/m3db/m3ctl/service/r2/store"
-	r2kv "github.com/m3db/m3ctl/service/r2/store/kv"
-	"github.com/m3db/m3metrics/aggregation"
-	"github.com/m3db/m3metrics/generated/proto/rulepb"
-	"github.com/m3db/m3metrics/matcher"
-	"github.com/m3db/m3metrics/metric/id"
-	"github.com/m3db/m3metrics/policy"
-	ruleskv "github.com/m3db/m3metrics/rules/store/kv"
-	"github.com/m3db/m3metrics/rules/view"
+	"github.com/m3db/m3/src/x/serialize"
 	"github.com/m3db/m3x/clock"
 	"github.com/m3db/m3x/instrument"
 	xlog "github.com/m3db/m3x/log"
@@ -73,7 +73,9 @@ func TestDownsamplerAggregationWithRulesStore(t *testing.T) {
 	rulesStore := testDownsampler.rulesStore
 
 	// Create rules
-	_, err := rulesStore.CreateNamespace("default", store.NewUpdateOptions())
+	nss, err := rulesStore.ReadNamespaces()
+	require.NoError(t, err)
+	_, err = nss.AddNamespace("default", testUpdateMetadata())
 	require.NoError(t, err)
 
 	rule := view.MappingRule{
@@ -83,8 +85,12 @@ func TestDownsamplerAggregationWithRulesStore(t *testing.T) {
 		AggregationID:   aggregation.MustCompressTypes(testAggregationType),
 		StoragePolicies: testAggregationStoragePolicies,
 	}
-	_, err = rulesStore.CreateMappingRule("default", rule,
-		store.NewUpdateOptions())
+
+	rs := rules.NewEmptyRuleSet("default", testUpdateMetadata())
+	_, err = rs.AddMappingRule(rule, testUpdateMetadata())
+	require.NoError(t, err)
+
+	err = rulesStore.WriteAll(nss, rs)
 	require.NoError(t, err)
 
 	logger := testDownsampler.instrumentOpts.Logger().
@@ -145,13 +151,14 @@ func testDownsamplerAggregation(
 	}
 
 	logger.Infof("write test metrics")
-	appender := downsampler.NewMetricsAppender()
+	appender, err := downsampler.NewMetricsAppender()
+	require.NoError(t, err)
 	defer appender.Finalize()
 
 	for _, metric := range testCounterMetrics {
 		appender.Reset()
 		for name, value := range metric.tags {
-			appender.AddTag(name, value)
+			appender.AddTag([]byte(name), []byte(value))
 		}
 
 		samplesAppender, err := appender.SamplesAppender()
@@ -165,7 +172,7 @@ func testDownsamplerAggregation(
 	for _, metric := range testGaugeMetrics {
 		appender.Reset()
 		for name, value := range metric.tags {
-			appender.AddTag(name, value)
+			appender.AddTag([]byte(name), []byte(value))
 		}
 
 		samplesAppender, err := appender.SamplesAppender()
@@ -192,16 +199,25 @@ func testDownsamplerAggregation(
 	writes := testDownsampler.storage.Writes()
 	for _, metric := range testCounterMetrics {
 		write := mustFindWrite(t, writes, metric.tags["__name__"])
-		assert.Equal(t, metric.tags, write.Tags.StringMap())
+		assert.Equal(t, metric.tags, tagsToStringMap(write.Tags))
 		require.Equal(t, 1, len(write.Datapoints))
 		assert.Equal(t, float64(metric.expected), write.Datapoints[0].Value)
 	}
 	for _, metric := range testGaugeMetrics {
 		write := mustFindWrite(t, writes, metric.tags["__name__"])
-		assert.Equal(t, metric.tags, write.Tags.StringMap())
+		assert.Equal(t, metric.tags, tagsToStringMap(write.Tags))
 		require.Equal(t, 1, len(write.Datapoints))
 		assert.Equal(t, float64(metric.expected), write.Datapoints[0].Value)
 	}
+}
+
+func tagsToStringMap(tags models.Tags) map[string]string {
+	stringMap := make(map[string]string, tags.Len())
+	for _, t := range tags.Tags {
+		stringMap[string(t.Name)] = string(t.Value)
+	}
+
+	return stringMap
 }
 
 type testDownsampler struct {
@@ -209,7 +225,7 @@ type testDownsampler struct {
 	downsampler    Downsampler
 	matcher        matcher.Matcher
 	storage        mock.Storage
-	rulesStore     store.Store
+	rulesStore     rules.Store
 	instrumentOpts instrument.Options
 }
 
@@ -240,13 +256,9 @@ func newTestDownsampler(t *testing.T, opts testDownsamplerOptions) testDownsampl
 	require.NoError(t, err)
 
 	rulesetKeyFmt := matcherOpts.RuleSetKeyFn()([]byte("%s"))
-	rulesStorageOpts := ruleskv.NewStoreOptions(matcherOpts.NamespacesKey(),
+	rulesStoreOpts := ruleskv.NewStoreOptions(matcherOpts.NamespacesKey(),
 		rulesetKeyFmt, nil)
-	rulesStorage := ruleskv.NewStore(rulesKVStore, rulesStorageOpts)
-
-	storeOpts := r2kv.NewStoreOptions().
-		SetRuleUpdatePropagationDelay(0)
-	rulesStore := r2kv.NewStore(rulesStorage, storeOpts)
+	rulesStore := ruleskv.NewStore(rulesKVStore, rulesStoreOpts)
 
 	tagEncoderOptions := serialize.NewTagEncoderOptions()
 	tagDecoderOptions := serialize.NewTagDecoderOptions()
@@ -259,7 +271,8 @@ func newTestDownsampler(t *testing.T, opts testDownsamplerOptions) testDownsampl
 			SetMetricsScope(instrumentOpts.MetricsScope().
 				SubScope("tag-decoder-pool")))
 
-	instance, err := NewDownsampler(DownsamplerOptions{
+	var cfg Configuration
+	instance, err := cfg.NewDownsampler(DownsamplerOptions{
 		Storage:               storage,
 		RulesKVStore:          rulesKVStore,
 		AutoMappingRules:      opts.autoMappingRules,
@@ -292,7 +305,7 @@ func newTestID(t *testing.T, tags map[string]string) id.ID {
 
 	tagsIter := newTags()
 	for name, value := range tags {
-		tagsIter.append(name, value)
+		tagsIter.append([]byte(name), []byte(value))
 	}
 
 	tagEncoder := tagEncoderPool.Get()
@@ -308,7 +321,7 @@ func newTestID(t *testing.T, tags map[string]string) id.ID {
 
 	tagDecoder := tagDecoderPool.Get()
 
-	iter := newEncodedTagsIterator(tagDecoder, nil)
+	iter := serialize.NewMetricTagsIterator(tagDecoder, nil)
 	iter.Reset(data.Bytes())
 	return iter
 }
@@ -316,8 +329,8 @@ func newTestID(t *testing.T, tags map[string]string) id.ID {
 func mustFindWrite(t *testing.T, writes []*storage.WriteQuery, name string) *storage.WriteQuery {
 	var write *storage.WriteQuery
 	for _, w := range writes {
-		if t, ok := w.Tags.Get(models.MetricName); ok {
-			if t == name {
+		if t, ok := w.Tags.Get([]byte("__name__")); ok {
+			if bytes.Equal(t, []byte(name)) {
 				write = w
 				break
 			}
@@ -326,4 +339,8 @@ func mustFindWrite(t *testing.T, writes []*storage.WriteQuery, name string) *sto
 
 	require.NotNil(t, write)
 	return write
+}
+
+func testUpdateMetadata() rules.UpdateMetadata {
+	return rules.NewRuleSetUpdateHelper(0).NewUpdateMetadata(time.Now().UnixNano(), "test")
 }

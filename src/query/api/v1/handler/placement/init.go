@@ -22,21 +22,36 @@ package placement
 
 import (
 	"net/http"
+	"path"
+	"time"
 
-	"github.com/m3db/m3/src/cmd/services/m3query/config"
+	"github.com/m3db/m3/src/cluster/placement"
 	"github.com/m3db/m3/src/query/api/v1/handler"
 	"github.com/m3db/m3/src/query/generated/proto/admin"
 	"github.com/m3db/m3/src/query/util/logging"
-	clusterclient "github.com/m3db/m3cluster/client"
-	"github.com/m3db/m3cluster/placement"
+	"github.com/m3db/m3/src/x/net/http"
 
 	"github.com/gogo/protobuf/jsonpb"
 	"go.uber.org/zap"
 )
 
 const (
-	// InitURL is the url for the placement init handler (with the POST method).
-	InitURL = handler.RoutePrefixV1 + "/placement/init"
+	initPathName = "init"
+)
+
+var (
+	// DeprecatedM3DBInitURL is the old url for the placement init handler, maintained for backwards
+	// compatibility. (with the POST method).
+	DeprecatedM3DBInitURL = path.Join(handler.RoutePrefixV1, PlacementPathName, initPathName)
+
+	// M3DBInitURL is the url for the placement init handler, (with the POST method).
+	M3DBInitURL = path.Join(handler.RoutePrefixV1, M3DBServicePlacementPathName, initPathName)
+
+	// M3AggInitURL is the url for the m3agg placement init handler (with the POST method).
+	M3AggInitURL = path.Join(handler.RoutePrefixV1, M3AggServicePlacementPathName, initPathName)
+
+	// M3CoordinatorInitURL is the url for the m3agg placement init handler (with the POST method).
+	M3CoordinatorInitURL = path.Join(handler.RoutePrefixV1, M3CoordinatorServicePlacementPathName, initPathName)
 
 	// InitHTTPMethod is the HTTP method used with this resource.
 	InitHTTPMethod = http.MethodPost
@@ -46,31 +61,31 @@ const (
 type InitHandler Handler
 
 // NewInitHandler returns a new instance of InitHandler.
-func NewInitHandler(client clusterclient.Client, cfg config.Configuration) *InitHandler {
-	return &InitHandler{client: client, cfg: cfg}
+func NewInitHandler(opts HandlerOptions) *InitHandler {
+	return &InitHandler{HandlerOptions: opts, nowFn: time.Now}
 }
 
-func (h *InitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *InitHandler) ServeHTTP(serviceName string, w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	logger := logging.WithContext(ctx)
 
 	req, rErr := h.parseRequest(r)
 	if rErr != nil {
-		handler.Error(w, rErr.Inner(), rErr.Code())
+		xhttp.Error(w, rErr.Inner(), rErr.Code())
 		return
 	}
 
-	placement, err := h.Init(r, req)
+	placement, err := h.Init(serviceName, r, req)
 	if err != nil {
 		logger.Error("unable to initialize placement", zap.Any("error", err))
-		handler.Error(w, err, http.StatusInternalServerError)
+		xhttp.Error(w, err, http.StatusInternalServerError)
 		return
 	}
 
 	placementProto, err := placement.Proto()
 	if err != nil {
 		logger.Error("unable to get placement protobuf", zap.Any("error", err))
-		handler.Error(w, err, http.StatusInternalServerError)
+		xhttp.Error(w, err, http.StatusInternalServerError)
 		return
 	}
 
@@ -78,14 +93,14 @@ func (h *InitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Placement: placementProto,
 	}
 
-	handler.WriteProtoMsgJSONResponse(w, resp, logger)
+	xhttp.WriteProtoMsgJSONResponse(w, resp, logger)
 }
 
-func (h *InitHandler) parseRequest(r *http.Request) (*admin.PlacementInitRequest, *handler.ParseError) {
+func (h *InitHandler) parseRequest(r *http.Request) (*admin.PlacementInitRequest, *xhttp.ParseError) {
 	defer r.Body.Close()
 	initReq := new(admin.PlacementInitRequest)
 	if err := jsonpb.Unmarshal(r.Body, initReq); err != nil {
-		return nil, handler.NewParseError(err, http.StatusBadRequest)
+		return nil, xhttp.NewParseError(err, http.StatusBadRequest)
 	}
 
 	return initReq, nil
@@ -93,6 +108,7 @@ func (h *InitHandler) parseRequest(r *http.Request) (*admin.PlacementInitRequest
 
 // Init initializes a placement.
 func (h *InitHandler) Init(
+	serviceName string,
 	httpReq *http.Request,
 	req *admin.PlacementInitRequest,
 ) (placement.Placement, error) {
@@ -101,13 +117,22 @@ func (h *InitHandler) Init(
 		return nil, err
 	}
 
-	service, err := Service(h.client, httpReq.Header)
+	serviceOpts := NewServiceOptions(
+		serviceName, httpReq.Header, h.M3AggServiceOptions)
+
+	service, err := Service(h.ClusterClient, serviceOpts, h.nowFn(), nil)
 	if err != nil {
 		return nil, err
 	}
 
+	replicationFactor := int(req.ReplicationFactor)
+	switch serviceName {
+	case M3CoordinatorServiceName:
+		// M3Coordinator placements are stateless
+		replicationFactor = 1
+	}
 	placement, err := service.BuildInitialPlacement(instances,
-		int(req.NumShards), int(req.ReplicationFactor))
+		int(req.NumShards), replicationFactor)
 	if err != nil {
 		return nil, err
 	}

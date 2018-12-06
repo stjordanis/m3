@@ -23,9 +23,10 @@ package httpd
 import (
 	"encoding/json"
 	"net/http"
-	"net/http/pprof"
+	_ "net/http/pprof" // needed for pprof handler registration
 	"time"
 
+	clusterclient "github.com/m3db/m3/src/cluster/client"
 	"github.com/m3db/m3/src/cmd/services/m3coordinator/downsample"
 	dbconfig "github.com/m3db/m3/src/cmd/services/m3dbnode/config"
 	"github.com/m3db/m3/src/cmd/services/m3query/config"
@@ -37,18 +38,21 @@ import (
 	"github.com/m3db/m3/src/query/api/v1/handler/placement"
 	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/native"
 	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/remote"
+	"github.com/m3db/m3/src/query/api/v1/handler/topic"
 	"github.com/m3db/m3/src/query/executor"
+	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/storage"
+	"github.com/m3db/m3/src/query/storage/m3"
 	"github.com/m3db/m3/src/query/util/logging"
-	clusterclient "github.com/m3db/m3cluster/client"
+	"github.com/m3db/m3/src/x/net/http"
 
+	"github.com/coreos/etcd/pkg/cors"
 	"github.com/gorilla/mux"
 	"github.com/uber-go/tally"
 )
 
 const (
 	healthURL = "/health"
-	pprofURL  = "/debug/pprof/profile"
 	routesURL = "/routes"
 )
 
@@ -58,38 +62,60 @@ var (
 
 // Handler represents an HTTP handler.
 type Handler struct {
-	Router        *mux.Router
+	router        *mux.Router
+	handler       http.Handler
 	storage       storage.Storage
 	downsampler   downsample.Downsampler
 	engine        *executor.Engine
+	clusters      m3.Clusters
 	clusterClient clusterclient.Client
 	config        config.Configuration
 	embeddedDbCfg *dbconfig.DBConfiguration
 	scope         tally.Scope
 	createdAt     time.Time
+	tagOptions    models.TagOptions
+}
+
+// Router returns the http handler registered with all relevant routes for query.
+func (h *Handler) Router() http.Handler {
+	return h.handler
 }
 
 // NewHandler returns a new instance of handler with routes.
 func NewHandler(
 	storage storage.Storage,
+	tagOptions models.TagOptions,
 	downsampler downsample.Downsampler,
 	engine *executor.Engine,
+	m3dbClusters m3.Clusters,
 	clusterClient clusterclient.Client,
 	cfg config.Configuration,
 	embeddedDbCfg *dbconfig.DBConfiguration,
 	scope tally.Scope,
 ) (*Handler, error) {
 	r := mux.NewRouter()
+
+	// apply middleware. Just CORS for now, but we could add more here as needed.
+	withMiddleware := &cors.CORSHandler{
+		Handler: r,
+		Info: &cors.CORSInfo{
+			"*": true,
+		},
+	}
+
 	h := &Handler{
-		Router:        r,
+		router:        r,
+		handler:       withMiddleware,
 		storage:       storage,
 		downsampler:   downsampler,
 		engine:        engine,
+		clusters:      m3dbClusters,
 		clusterClient: clusterClient,
 		config:        cfg,
 		embeddedDbCfg: embeddedDbCfg,
 		scope:         scope,
 		createdAt:     time.Now(),
+		tagOptions:    tagOptions,
 	}
 	return h, nil
 }
@@ -98,28 +124,68 @@ func NewHandler(
 func (h *Handler) RegisterRoutes() error {
 	logged := logging.WithResponseTimeLogging
 
-	h.Router.HandleFunc(openapi.URL, logged(&openapi.DocHandler{}).ServeHTTP).Methods(openapi.HTTPMethod)
-	h.Router.PathPrefix(openapi.StaticURLPrefix).Handler(logged(openapi.StaticHandler()))
+	h.router.HandleFunc(openapi.URL,
+		logged(&openapi.DocHandler{}).ServeHTTP,
+	).Methods(openapi.HTTPMethod)
+	h.router.PathPrefix(openapi.StaticURLPrefix).Handler(logged(openapi.StaticHandler()))
 
 	// Prometheus remote read/write endpoints
 	promRemoteReadHandler := remote.NewPromReadHandler(h.engine, h.scope.Tagged(remoteSource))
-	promRemoteWriteHandler, err := remote.NewPromWriteHandler(h.storage, nil, h.scope.Tagged(remoteSource))
+	promRemoteWriteHandler, err := remote.NewPromWriteHandler(
+		h.storage,
+		h.downsampler,
+		h.tagOptions,
+		h.scope.Tagged(remoteSource),
+	)
 	if err != nil {
 		return err
 	}
 
-	h.Router.HandleFunc(remote.PromReadURL, logged(promRemoteReadHandler).ServeHTTP).Methods(remote.PromReadHTTPMethod)
-	h.Router.HandleFunc(remote.PromWriteURL, logged(promRemoteWriteHandler).ServeHTTP).Methods(remote.PromWriteHTTPMethod)
-	h.Router.HandleFunc(native.PromReadURL, logged(native.NewPromReadHandler(h.engine)).ServeHTTP).Methods(native.PromReadHTTPMethod)
+	h.router.HandleFunc(remote.PromReadURL,
+		logged(promRemoteReadHandler).ServeHTTP,
+	).Methods(remote.PromReadHTTPMethod)
+	h.router.HandleFunc(remote.PromWriteURL,
+		promRemoteWriteHandler.ServeHTTP,
+	).Methods(remote.PromWriteHTTPMethod)
+	h.router.HandleFunc(native.PromReadURL,
+		logged(native.NewPromReadHandler(h.engine, h.tagOptions, &h.config.Limits)).ServeHTTP,
+	).Methods(native.PromReadHTTPMethod)
+	h.router.HandleFunc(native.PromReadInstantURL,
+		logged(native.NewPromReadInstantHandler(h.engine, h.tagOptions)).ServeHTTP,
+	).Methods(native.PromReadInstantHTTPMethod)
 
 	// Native M3 search and write endpoints
-	h.Router.HandleFunc(handler.SearchURL, logged(handler.NewSearchHandler(h.storage)).ServeHTTP).Methods(handler.SearchHTTPMethod)
-	h.Router.HandleFunc(m3json.WriteJSONURL, logged(m3json.NewWriteJSONHandler(h.storage)).ServeHTTP).Methods(m3json.JSONWriteHTTPMethod)
+	h.router.HandleFunc(handler.SearchURL,
+		logged(handler.NewSearchHandler(h.storage)).ServeHTTP,
+	).Methods(handler.SearchHTTPMethod)
+	h.router.HandleFunc(m3json.WriteJSONURL,
+		logged(m3json.NewWriteJSONHandler(h.storage)).ServeHTTP,
+	).Methods(m3json.JSONWriteHTTPMethod)
+
+	// Tag completion endpoints
+	h.router.HandleFunc(native.CompleteTagsURL,
+		logged(native.NewCompleteTagsHandler(h.storage)).ServeHTTP,
+	).Methods(native.CompleteTagsHTTPMethod)
+	h.router.HandleFunc(remote.TagValuesURL,
+		logged(remote.NewTagValuesHandler(h.storage)).ServeHTTP,
+	).Methods(remote.TagValuesHTTPMethod)
+
+	// Series match endpoints
+	h.router.HandleFunc(remote.PromSeriesMatchURL,
+		logged(remote.NewPromSeriesMatchHandler(h.storage, h.tagOptions)).ServeHTTP,
+	).Methods(remote.PromSeriesMatchHTTPMethod)
 
 	if h.clusterClient != nil {
-		placement.RegisterRoutes(h.Router, h.clusterClient, h.config)
-		namespace.RegisterRoutes(h.Router, h.clusterClient)
-		database.RegisterRoutes(h.Router, h.clusterClient, h.config, h.embeddedDbCfg)
+		placementOpts := placement.HandlerOptions{
+			ClusterClient:       h.clusterClient,
+			Config:              h.config,
+			M3AggServiceOptions: h.m3AggServiceOptions(),
+		}
+
+		placement.RegisterRoutes(h.router, placementOpts)
+		namespace.RegisterRoutes(h.router, h.clusterClient)
+		database.RegisterRoutes(h.router, h.clusterClient, h.config, h.embeddedDbCfg)
+		topic.RegisterRoutes(h.router, h.clusterClient, h.config)
 	}
 
 	h.registerHealthEndpoints()
@@ -129,9 +195,31 @@ func (h *Handler) RegisterRoutes() error {
 	return nil
 }
 
+func (h *Handler) m3AggServiceOptions() *placement.M3AggServiceOptions {
+	if h.clusters == nil {
+		return nil
+	}
+
+	maxResolution := time.Duration(0)
+	for _, ns := range h.clusters.ClusterNamespaces() {
+		resolution := ns.Options().Attributes().Resolution
+		if resolution > maxResolution {
+			maxResolution = resolution
+		}
+	}
+
+	if maxResolution == 0 {
+		return nil
+	}
+
+	return &placement.M3AggServiceOptions{
+		MaxAggregationWindowSize: maxResolution,
+	}
+}
+
 // Endpoints useful for profiling the service
 func (h *Handler) registerHealthEndpoints() {
-	h.Router.HandleFunc(healthURL, func(w http.ResponseWriter, r *http.Request) {
+	h.router.HandleFunc(healthURL, func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(struct {
 			Uptime string `json:"uptime"`
 		}{
@@ -142,14 +230,14 @@ func (h *Handler) registerHealthEndpoints() {
 
 // Endpoints useful for profiling the service
 func (h *Handler) registerProfileEndpoints() {
-	h.Router.HandleFunc(pprofURL, pprof.Profile)
+	h.router.PathPrefix("/debug/pprof/").Handler(http.DefaultServeMux)
 }
 
 // Endpoints useful for viewing routes directory
 func (h *Handler) registerRoutesEndpoint() {
-	h.Router.HandleFunc(routesURL, func(w http.ResponseWriter, r *http.Request) {
+	h.router.HandleFunc(routesURL, func(w http.ResponseWriter, r *http.Request) {
 		var routes []string
-		err := h.Router.Walk(
+		err := h.router.Walk(
 			func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {
 				str, err := route.GetPathTemplate()
 				if err != nil {
@@ -159,7 +247,7 @@ func (h *Handler) registerRoutesEndpoint() {
 				return nil
 			})
 		if err != nil {
-			handler.Error(w, err, http.StatusInternalServerError)
+			xhttp.Error(w, err, http.StatusInternalServerError)
 			return
 		}
 		json.NewEncoder(w).Encode(struct {

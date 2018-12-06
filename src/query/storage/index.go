@@ -30,44 +30,53 @@ import (
 )
 
 // FromM3IdentToMetric converts an M3 ident metric to a coordinator metric
-func FromM3IdentToMetric(identID ident.ID, iterTags ident.TagIterator) (*models.Metric, error) {
+func FromM3IdentToMetric(
+	identID ident.ID,
+	iterTags ident.TagIterator,
+	tagOptions models.TagOptions,
+) (models.Metric, error) {
 	id := identID.String()
-	tags, err := FromIdentTagIteratorToTags(iterTags)
+	tags, err := FromIdentTagIteratorToTags(iterTags, tagOptions)
 	if err != nil {
-		return nil, err
+		return models.Metric{}, err
 	}
 
-	return &models.Metric{
+	return models.Metric{
 		ID:   id,
 		Tags: tags,
 	}, nil
 }
 
 // FromIdentTagIteratorToTags converts ident tags to coordinator tags
-func FromIdentTagIteratorToTags(identTags ident.TagIterator) (models.Tags, error) {
-	tags := make(models.Tags, 0, identTags.Remaining())
-
+func FromIdentTagIteratorToTags(
+	identTags ident.TagIterator,
+	tagOptions models.TagOptions,
+) (models.Tags, error) {
+	tags := models.NewTags(identTags.Remaining(), tagOptions)
 	for identTags.Next() {
 		identTag := identTags.Current()
-		tags = append(tags, models.Tag{
-			Name:  identTag.Name.String(),
-			Value: identTag.Value.String(),
+		tags = tags.AddTag(models.Tag{
+			Name:  identTag.Name.Bytes(),
+			Value: identTag.Value.Bytes(),
 		})
 	}
 
 	if err := identTags.Err(); err != nil {
-		return nil, err
+		return models.EmptyTags(), err
 	}
 
-	return models.Normalize(tags), nil
+	return tags, nil
 }
 
 // TagsToIdentTagIterator converts coordinator tags to ident tags
 func TagsToIdentTagIterator(tags models.Tags) ident.TagIterator {
-	identTags := make([]ident.Tag, 0, len(tags))
-
-	for _, t := range tags {
-		identTags = append(identTags, ident.StringTag(t.Name, t.Value))
+	//TODO get a tags and tag iterator from an ident.Pool here rather than allocing them here
+	identTags := make([]ident.Tag, 0, tags.Len())
+	for _, t := range tags.Tags {
+		identTags = append(identTags, ident.Tag{
+			Name:  ident.BytesID(t.Name),
+			Value: ident.BytesID(t.Value),
+		})
 	}
 
 	return ident.NewTagsIterator(ident.NewTags(identTags...))
@@ -98,7 +107,7 @@ func FetchQueryToM3Query(fetchQuery *FetchQuery) (index.Query, error) {
 	return index.Query{Query: q}, nil
 }
 
-func matcherToQuery(matcher *models.Matcher) (idx.Query, error) {
+func matcherToQuery(matcher models.Matcher) (idx.Query, error) {
 	negate := false
 	switch matcher.Type {
 	// Support for Regexp types
@@ -106,7 +115,7 @@ func matcherToQuery(matcher *models.Matcher) (idx.Query, error) {
 		negate = true
 		fallthrough
 	case models.MatchRegexp:
-		query, err := idx.NewRegexpQuery([]byte(matcher.Name), []byte(matcher.Value))
+		query, err := idx.NewRegexpQuery(matcher.Name, matcher.Value)
 		if err != nil {
 			return idx.Query{}, err
 		}
@@ -120,7 +129,7 @@ func matcherToQuery(matcher *models.Matcher) (idx.Query, error) {
 		negate = true
 		fallthrough
 	case models.MatchEqual:
-		query := idx.NewTermQuery([]byte(matcher.Name), []byte(matcher.Value))
+		query := idx.NewTermQuery(matcher.Name, matcher.Value)
 		if negate {
 			query = idx.NewNegationQuery(query)
 		}

@@ -1,4 +1,4 @@
-# M3 [![GoDoc][doc-img]][doc] [![Build Status][ci-img]][ci] [![Coverage Status](https://codecov.io/gh/m3db/m3/branch/master/graph/badge.svg)](https://codecov.io/gh/m3db/m3) [![Gitter chat][gitter-img]](https://gitter.im/m3db/Lobby)
+# M3 [![GoDoc][doc-img]][doc] [![Build Status][ci-img]][ci] [![Coverage Status][cov-img]][cov] [![FOSSA Status][fossa-img]][fossa] [![Gitter chat][gitter-img]][gitter]
 
 <p align="center"><img src="docs/theme/assets/images/M3-logo.png" alt="M3 Logo" width="256" height="270"></p>
 
@@ -6,8 +6,10 @@ Distributed TSDB and Query Engine, Prometheus Sidecar, Metrics Aggregator, and m
 
 More information:
 - [Documentation](https://m3db.github.io/m3/)
-- [Developers](https://github.com/m3db/m3/blob/master/DEVELOPER.md)
+- [Developer: Getting Started](https://github.com/m3db/m3/blob/master/DEVELOPER.md)
 - [Gitter (chat channel)](https://gitter.im/m3db/Lobby)
+- [Forum (Google Group)](https://groups.google.com/forum/#!forum/m3db)
+- [Twitter](https://twitter.com/m3db_io)
 
 ## Test it out
 
@@ -17,7 +19,7 @@ More information:
 
 ```
 # to build a local m3dbnode process
-make m3dbnode
+make m3dbnode (note that we currently require at least Go 1.10 or higher)
 
 # run it with the sample configuration
 ./bin/m3dbnode -f ./src/dbnode/config/m3dbnode-local-etcd.yml
@@ -88,7 +90,7 @@ produce a lightweight production image from a single Dockerfile. Accordingly, it
 17.05 or later to build.
 
 ```
-docker build -t m3dbnode:$(git rev-parse head) .
+docker build -f docker/m3dbnode/Dockerfile -t m3dbnode:$(git rev-parse head) .
 docker run --name m3dbnode m3dbnode:$(git rev-parse head)
 ```
 
@@ -96,7 +98,7 @@ If you wish to build an image with the source code included you can stop the bui
 `builder` stage:
 
 ```
-docker build -t m3dbnode:$(git rev-parse head) --target builder .
+docker build -f docker/m3dbnode/Dockerfile -t m3dbnode:$(git rev-parse head) --target builder .
 ```
 
 ## Configuration
@@ -115,6 +117,11 @@ This project is released under the [Apache License, Version 2.0](LICENSE).
 
 [doc-img]: https://godoc.org/github.com/m3db/m3?status.svg
 [doc]: https://godoc.org/github.com/m3db/m3
-[ci-img]: https://semaphoreci.com/api/v1/m3db/m3/branches/master/shields_badge.svg
-[ci]: https://semaphoreci.com/m3db/m3
+[ci-img]: https://badge.buildkite.com/6a2d61d43ebff20a6adf5de5dc3946f0d484c04200b62e0bee.svg?branch=master
+[ci]: https://buildkite.com/m3/m3-monorepo-ci
+[cov-img]: https://codecov.io/gh/m3db/m3/branch/master/graph/badge.svg
+[cov]: https://codecov.io/gh/m3db/m3
+[fossa-img]: https://app.fossa.io/api/projects/custom%2B4529%2Fgithub.com%2Fm3db%2Fm3.svg?type=shield
+[fossa]: https://app.fossa.io/projects/custom%2B4529%2Fgithub.com%2Fm3db%2Fm3?ref=badge_shield
 [gitter-img]: https://badges.gitter.im/m3db.png
+[gitter]: https://gitter.im/m3db/Lobby

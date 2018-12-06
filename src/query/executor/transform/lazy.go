@@ -137,17 +137,41 @@ func (s *seriesIter) Next() bool {
 }
 
 type lazyBlock struct {
-	mu sync.Mutex
-
+	mu             sync.Mutex
 	rawBlock       block.Block
 	lazyNode       *lazyNode
 	ID             parser.NodeID
 	processedBlock block.Block
+	processError   error
+}
+
+// Unconsolidated returns the unconsolidated version for the block
+func (f *lazyBlock) Unconsolidated() (block.UnconsolidatedBlock, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.processError != nil {
+		return nil, f.processError
+	}
+
+	if f.processedBlock != nil {
+		return f.processedBlock.Unconsolidated()
+	}
+
+	if err := f.process(); err != nil {
+		return nil, err
+	}
+
+	return f.processedBlock.Unconsolidated()
 }
 
 func (f *lazyBlock) StepIter() (block.StepIter, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if f.processError != nil {
+		return nil, f.processError
+	}
 
 	if f.processedBlock != nil {
 		return f.processedBlock.StepIter()
@@ -178,6 +202,10 @@ func (f *lazyBlock) SeriesIter() (block.SeriesIter, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if f.processError != nil {
+		return nil, f.processError
+	}
+
 	if f.processedBlock != nil {
 		return f.processedBlock.SeriesIter()
 	}
@@ -203,6 +231,13 @@ func (f *lazyBlock) SeriesIter() (block.SeriesIter, error) {
 	return f.processedBlock.SeriesIter()
 }
 
+func (f *lazyBlock) WithMetadata(
+	meta block.Metadata,
+	seriesMetas []block.SeriesMeta,
+) (block.Block, error) {
+	return f.rawBlock.WithMetadata(meta, seriesMetas)
+}
+
 func (f *lazyBlock) Close() error {
 	return f.rawBlock.Close()
 }
@@ -210,6 +245,7 @@ func (f *lazyBlock) Close() error {
 func (f *lazyBlock) process() error {
 	err := f.lazyNode.fNode.Process(f.ID, f.rawBlock)
 	if err != nil {
+		f.processError = err
 		return err
 	}
 

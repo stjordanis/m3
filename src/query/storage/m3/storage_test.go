@@ -29,13 +29,14 @@ import (
 	"time"
 
 	"github.com/m3db/m3/src/dbnode/client"
+	"github.com/m3db/m3/src/dbnode/encoding"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/storage"
 	"github.com/m3db/m3/src/query/test/seriesiter"
 	"github.com/m3db/m3/src/query/ts"
-	"github.com/m3db/m3/src/query/util/logging"
 	"github.com/m3db/m3x/ident"
 	"github.com/m3db/m3x/sync"
+	xtest "github.com/m3db/m3x/test"
 	xtime "github.com/m3db/m3x/time"
 
 	"github.com/golang/mock/gomock"
@@ -43,17 +44,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var testRetention = 30 * 24 * time.Hour
+const (
+	test1MonthRetention  = 30 * 24 * time.Hour
+	test3MonthRetention  = 90 * 24 * time.Hour
+	test6MonthRetention  = 180 * 24 * time.Hour
+	test1YearRetention   = 365 * 24 * time.Hour
+	testLongestRetention = test1YearRetention
+)
 
 type testSessions struct {
-	unaggregated1MonthRetention                *client.MockSession
-	aggregated1MonthRetention1MinuteResolution *client.MockSession
+	unaggregated1MonthRetention                       *client.MockSession
+	aggregated1MonthRetention1MinuteResolution        *client.MockSession
+	aggregated3MonthRetention5MinuteResolution        *client.MockSession
+	aggregatedPartial6MonthRetention1MinuteResolution *client.MockSession
+	aggregated1YearRetention10MinuteResolution        *client.MockSession
 }
 
 func (s testSessions) forEach(fn func(session *client.MockSession)) {
 	for _, session := range []*client.MockSession{
 		s.unaggregated1MonthRetention,
 		s.aggregated1MonthRetention1MinuteResolution,
+		s.aggregated3MonthRetention5MinuteResolution,
+		s.aggregatedPartial6MonthRetention1MinuteResolution,
+		s.aggregated1YearRetention10MinuteResolution,
 	} {
 		fn(session)
 	}
@@ -63,43 +76,67 @@ func setup(
 	t *testing.T,
 	ctrl *gomock.Controller,
 ) (storage.Storage, testSessions) {
-	logging.InitWithCores(nil)
-	logger := logging.WithContext(context.TODO())
-	defer logger.Sync()
 	unaggregated1MonthRetention := client.NewMockSession(ctrl)
 	aggregated1MonthRetention1MinuteResolution := client.NewMockSession(ctrl)
+	aggregated3MonthRetention5MinuteResolution := client.NewMockSession(ctrl)
+	aggregatedPartial6MonthRetention1MinuteResolution := client.NewMockSession(ctrl)
+	aggregated1YearRetention10MinuteResolution := client.NewMockSession(ctrl)
 	clusters, err := NewClusters(UnaggregatedClusterNamespaceDefinition{
 		NamespaceID: ident.StringID("metrics_unaggregated"),
 		Session:     unaggregated1MonthRetention,
-		Retention:   testRetention,
+		Retention:   test1MonthRetention,
 	}, AggregatedClusterNamespaceDefinition{
-		NamespaceID: ident.StringID("metrics_aggregated"),
+		NamespaceID: ident.StringID("metrics_aggregated_1m:30d"),
 		Session:     aggregated1MonthRetention1MinuteResolution,
-		Retention:   testRetention,
+		Retention:   test1MonthRetention,
 		Resolution:  time.Minute,
+	}, AggregatedClusterNamespaceDefinition{
+		NamespaceID: ident.StringID("metrics_aggregated_5m:90d"),
+		Session:     aggregated3MonthRetention5MinuteResolution,
+		Retention:   test3MonthRetention,
+		Resolution:  5 * time.Minute,
+	}, AggregatedClusterNamespaceDefinition{
+		NamespaceID: ident.StringID("metrics_aggregated_partial_1m:180d"),
+		Session:     aggregatedPartial6MonthRetention1MinuteResolution,
+		Retention:   test6MonthRetention,
+		Resolution:  1 * time.Minute,
+		Downsample:  &ClusterNamespaceDownsampleOptions{All: false},
+	}, AggregatedClusterNamespaceDefinition{
+		NamespaceID: ident.StringID("metrics_aggregated_10m:365d"),
+		Session:     aggregated1YearRetention10MinuteResolution,
+		Retention:   test1YearRetention,
+		Resolution:  10 * time.Minute,
 	})
 	require.NoError(t, err)
+	return newTestStorage(t, clusters), testSessions{
+		unaggregated1MonthRetention:                       unaggregated1MonthRetention,
+		aggregated1MonthRetention1MinuteResolution:        aggregated1MonthRetention1MinuteResolution,
+		aggregated3MonthRetention5MinuteResolution:        aggregated3MonthRetention5MinuteResolution,
+		aggregatedPartial6MonthRetention1MinuteResolution: aggregatedPartial6MonthRetention1MinuteResolution,
+		aggregated1YearRetention10MinuteResolution:        aggregated1YearRetention10MinuteResolution,
+	}
+}
+
+func newTestStorage(t *testing.T, clusters Clusters) storage.Storage {
 	writePool, err := sync.NewPooledWorkerPool(10, sync.NewPooledWorkerPoolOptions())
 	require.NoError(t, err)
 	writePool.Init()
-	storage := NewStorage(clusters, nil, writePool)
-	return storage, testSessions{
-		unaggregated1MonthRetention:                unaggregated1MonthRetention,
-		aggregated1MonthRetention1MinuteResolution: aggregated1MonthRetention1MinuteResolution,
-	}
+	opts := models.NewTagOptions().SetMetricName([]byte("name"))
+	storage := NewStorage(clusters, nil, writePool, opts)
+	return storage
 }
 
 func newFetchReq() *storage.FetchQuery {
 	matchers := models.Matchers{
 		{
 			Type:  models.MatchEqual,
-			Name:  "foo",
-			Value: "bar",
+			Name:  []byte("foo"),
+			Value: []byte("bar"),
 		},
 		{
 			Type:  models.MatchEqual,
-			Name:  "biz",
-			Value: "baz",
+			Name:  []byte("biz"),
+			Value: []byte("baz"),
 		},
 	}
 	return &storage.FetchQuery{
@@ -110,7 +147,11 @@ func newFetchReq() *storage.FetchQuery {
 }
 
 func newWriteQuery() *storage.WriteQuery {
-	tags := map[string]string{"foo": "bar", "biz": "baz"}
+	tags := models.EmptyTags().AddTags([]models.Tag{
+		{Name: []byte("foo"), Value: []byte("bar")},
+		{Name: []byte("biz"), Value: []byte("baz")},
+	})
+
 	datapoints := ts.Datapoints{{
 		Timestamp: time.Now(),
 		Value:     1.0,
@@ -120,7 +161,7 @@ func newWriteQuery() *storage.WriteQuery {
 			Value:     2.0,
 		}}
 	return &storage.WriteQuery{
-		Tags:       models.FromMap(tags),
+		Tags:       tags,
 		Unit:       xtime.Millisecond,
 		Datapoints: datapoints,
 	}
@@ -207,39 +248,178 @@ func TestLocalWriteAggregatedSuccess(t *testing.T) {
 }
 
 func TestLocalRead(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := gomock.NewController(xtest.Reporter{T: t})
 	defer ctrl.Finish()
 	store, sessions := setup(t, ctrl)
 	testTags := seriesiter.GenerateTag()
-	sessions.forEach(func(session *client.MockSession) {
-		session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).
-			Return(seriesiter.NewMockSeriesIters(ctrl, testTags, 1, 2), true, nil)
-		session.EXPECT().IteratorPools().
-			Return(nil, nil).AnyTimes()
-	})
+
+	session := sessions.unaggregated1MonthRetention
+	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(seriesiter.NewMockSeriesIters(ctrl, testTags, 1, 2), true, nil)
+	session.EXPECT().IteratorPools().
+		Return(newTestIteratorPools(ctrl), nil).AnyTimes()
 
 	searchReq := newFetchReq()
 	results, err := store.Fetch(context.TODO(), searchReq, &storage.FetchOptions{Limit: 100})
 	assert.NoError(t, err)
-	tags := make(map[string]string, 1)
-	tags[testTags.Name.String()] = testTags.Value.String()
+	tags := []models.Tag{{Name: testTags.Name.Bytes(), Value: testTags.Value.Bytes()}}
 	require.NotNil(t, results)
 	require.NotNil(t, results.SeriesList)
 	require.Len(t, results.SeriesList, 1)
 	require.NotNil(t, results.SeriesList[0])
-	assert.Equal(t, models.FromMap(tags), results.SeriesList[0].Tags)
+	assert.Equal(t, tags, results.SeriesList[0].Tags.Tags)
+	assert.Equal(t, []byte("name"), results.SeriesList[0].Tags.Opts.MetricName())
 }
 
-func TestLocalReadNoClustersForTimeRangeError(t *testing.T) {
+func TestLocalReadExceedsRetention(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	store, _ := setup(t, ctrl)
+	store, sessions := setup(t, ctrl)
+	testTag := seriesiter.GenerateTag()
+
+	session := sessions.aggregated1YearRetention10MinuteResolution
+	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(seriesiter.NewMockSeriesIters(ctrl, testTag, 1, 2), true, nil)
+	session.EXPECT().IteratorPools().Return(nil, nil).AnyTimes()
+
 	searchReq := newFetchReq()
-	searchReq.Start = time.Now().Add(-2 * testRetention)
+	searchReq.Start = time.Now().Add(-2 * testLongestRetention)
 	searchReq.End = time.Now()
-	_, err := store.Fetch(context.TODO(), searchReq, &storage.FetchOptions{Limit: 100})
-	require.Error(t, err)
-	assert.Equal(t, errNoLocalClustersFulfillsQuery, err)
+	results, err := store.Fetch(context.TODO(), searchReq, &storage.FetchOptions{Limit: 100})
+	require.NoError(t, err)
+	assertFetchResult(t, results, testTag)
+}
+
+func TestLocalReadExceedsUnaggregatedRetentionWithinAggregatedRetention(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	store, sessions := setup(t, ctrl)
+	testTag := seriesiter.GenerateTag()
+
+	session := sessions.aggregated3MonthRetention5MinuteResolution
+	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(seriesiter.NewMockSeriesIters(ctrl, testTag, 1, 2), true, nil)
+	session.EXPECT().IteratorPools().Return(newTestIteratorPools(ctrl), nil).AnyTimes()
+
+	session = sessions.aggregatedPartial6MonthRetention1MinuteResolution
+	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(encoding.EmptySeriesIterators, true, nil)
+	session.EXPECT().IteratorPools().Return(newTestIteratorPools(ctrl), nil).AnyTimes()
+
+	// Test searching between 1month and 3 months (so 2 months) to hit multiple aggregated
+	// namespaces that we need to choose from
+	searchReq := newFetchReq()
+	searchReq.Start = time.Now().Add(-2 * test1MonthRetention)
+	searchReq.End = time.Now()
+	results, err := store.Fetch(context.TODO(), searchReq, &storage.FetchOptions{Limit: 100})
+	require.NoError(t, err)
+	assertFetchResult(t, results, testTag)
+}
+
+func TestLocalReadExceedsAggregatedButNotUnaggregatedAndPartialAggregated(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	unaggregated1MonthRetention := client.NewMockSession(ctrl)
+	aggregatedPartial6MonthRetention1MinuteResolution := client.NewMockSession(ctrl)
+
+	clusters, err := NewClusters(UnaggregatedClusterNamespaceDefinition{
+		NamespaceID: ident.StringID("metrics_unaggregated"),
+		Session:     unaggregated1MonthRetention,
+		Retention:   test1MonthRetention,
+	}, AggregatedClusterNamespaceDefinition{
+		NamespaceID: ident.StringID("metrics_aggregated_1m:180d"),
+		Session:     aggregatedPartial6MonthRetention1MinuteResolution,
+		Retention:   test6MonthRetention,
+		Resolution:  time.Minute,
+		Downsample:  &ClusterNamespaceDownsampleOptions{All: false},
+	})
+	require.NoError(t, err)
+
+	store := newTestStorage(t, clusters)
+
+	testTag := seriesiter.GenerateTag()
+
+	session := unaggregated1MonthRetention
+	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(seriesiter.NewMockSeriesIters(ctrl, testTag, 1, 2), true, nil)
+	session.EXPECT().IteratorPools().Return(newTestIteratorPools(ctrl), nil).AnyTimes()
+
+	session = aggregatedPartial6MonthRetention1MinuteResolution
+	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(encoding.EmptySeriesIterators, true, nil)
+	session.EXPECT().IteratorPools().Return(newTestIteratorPools(ctrl), nil).AnyTimes()
+
+	// Test searching past unaggregated namespace and verify that we fan out to both
+	// the unaggregated namespaces and the partial aggregated namespace
+	searchReq := newFetchReq()
+	searchReq.Start = time.Now().Add(-2 * test1MonthRetention)
+	searchReq.End = time.Now()
+	results, err := store.Fetch(context.TODO(), searchReq, &storage.FetchOptions{Limit: 100})
+	require.NoError(t, err)
+	assertFetchResult(t, results, testTag)
+}
+
+func TestLocalReadExceedsAggregatedAndPartialAggregated(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	unaggregated1MonthRetention := client.NewMockSession(ctrl)
+	aggregated3MonthRetention5MinuteResolution := client.NewMockSession(ctrl)
+	aggregatedPartial6MonthRetention1MinuteResolution := client.NewMockSession(ctrl)
+
+	clusters, err := NewClusters(UnaggregatedClusterNamespaceDefinition{
+		NamespaceID: ident.StringID("metrics_unaggregated"),
+		Session:     unaggregated1MonthRetention,
+		Retention:   test1MonthRetention,
+	}, AggregatedClusterNamespaceDefinition{
+		NamespaceID: ident.StringID("metrics_aggregated_5m:90d"),
+		Session:     aggregated3MonthRetention5MinuteResolution,
+		Retention:   test3MonthRetention,
+		Resolution:  5 * time.Minute,
+	}, AggregatedClusterNamespaceDefinition{
+		NamespaceID: ident.StringID("metrics_aggregated_1m:180d"),
+		Session:     aggregatedPartial6MonthRetention1MinuteResolution,
+		Retention:   test6MonthRetention,
+		Resolution:  time.Minute,
+		Downsample:  &ClusterNamespaceDownsampleOptions{All: false},
+	})
+	require.NoError(t, err)
+
+	store := newTestStorage(t, clusters)
+
+	testTag := seriesiter.GenerateTag()
+
+	session := aggregated3MonthRetention5MinuteResolution
+	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(seriesiter.NewMockSeriesIters(ctrl, testTag, 1, 2), true, nil)
+	session.EXPECT().IteratorPools().Return(newTestIteratorPools(ctrl), nil).AnyTimes()
+
+	session = aggregatedPartial6MonthRetention1MinuteResolution
+	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(encoding.EmptySeriesIterators, true, nil)
+	session.EXPECT().IteratorPools().Return(newTestIteratorPools(ctrl), nil).AnyTimes()
+
+	// Test searching past aggregated and partially aggregated namespace, fan out to both
+	searchReq := newFetchReq()
+	searchReq.Start = time.Now().Add(-2 * test6MonthRetention)
+	searchReq.End = time.Now()
+	results, err := store.Fetch(context.TODO(), searchReq, &storage.FetchOptions{Limit: 100})
+	require.NoError(t, err)
+	assertFetchResult(t, results, testTag)
+}
+
+func assertFetchResult(t *testing.T, results *storage.FetchResult, testTag ident.Tag) {
+	tags := []models.Tag{{
+		Name:  testTag.Name.Bytes(),
+		Value: testTag.Value.Bytes(),
+	}}
+
+	require.NotNil(t, results)
+	require.NotNil(t, results.SeriesList)
+	require.Len(t, results.SeriesList, 1)
+	require.NotNil(t, results.SeriesList[0])
+	assert.Equal(t, tags, results.SeriesList[0].Tags.Tags)
 }
 
 func TestLocalSearchError(t *testing.T) {
@@ -279,9 +459,21 @@ func TestLocalSearchSuccess(t *testing.T) {
 		},
 		{
 			id:        "bar",
-			namespace: "metrics_aggregated",
+			namespace: "metrics_aggregated_1m:30d",
 			tagName:   "qel",
 			tagValue:  "quz",
+		},
+		{
+			id:        "baz",
+			namespace: "metrics_aggregated_5m:90d",
+			tagName:   "qam",
+			tagValue:  "qak",
+		},
+		{
+			id:        "qux",
+			namespace: "metrics_aggregated_10m:365d",
+			tagName:   "qed",
+			tagValue:  "qad",
 		},
 	}
 
@@ -292,8 +484,23 @@ func TestLocalSearchSuccess(t *testing.T) {
 			f = fetches[0]
 		case session == sessions.aggregated1MonthRetention1MinuteResolution:
 			f = fetches[1]
+		case session == sessions.aggregated3MonthRetention5MinuteResolution:
+			f = fetches[2]
+		case session == sessions.aggregated1YearRetention10MinuteResolution:
+			f = fetches[3]
 		default:
-			require.FailNow(t, "unexpected session")
+			// Not expecting from other (partial) namespaces
+			iter := client.NewMockTaggedIDsIterator(ctrl)
+			gomock.InOrder(
+				iter.EXPECT().Next().Return(false),
+				iter.EXPECT().Err().Return(nil),
+				iter.EXPECT().Finalize(),
+			)
+			session.EXPECT().FetchTaggedIDs(gomock.Any(), gomock.Any(), gomock.Any()).
+				Return(iter, true, nil)
+			session.EXPECT().IteratorPools().
+				Return(nil, nil).AnyTimes()
+			return
 		}
 		iter := client.NewMockTaggedIDsIterator(ctrl)
 		gomock.InOrder(
@@ -329,7 +536,7 @@ func TestLocalSearchSuccess(t *testing.T) {
 		expected[f.id] = f
 	}
 
-	actual := make(map[string]*models.Metric)
+	actual := make(map[string]models.Metric)
 	for _, m := range result.Metrics {
 		actual[m.ID] = m
 	}
@@ -339,8 +546,25 @@ func TestLocalSearchSuccess(t *testing.T) {
 		require.True(t, ok)
 
 		assert.Equal(t, expected.id, actual.ID)
-		assert.Equal(t, models.Tags{{
-			Name: expected.tagName, Value: expected.tagValue,
-		}}, actual.Tags)
+		assert.Equal(t, []models.Tag{{
+			Name: []byte(expected.tagName), Value: []byte(expected.tagValue),
+		}}, actual.Tags.Tags)
 	}
+}
+
+func newTestIteratorPools(ctrl *gomock.Controller) encoding.IteratorPools {
+	pools := encoding.NewMockIteratorPools(ctrl)
+
+	mutablePool := encoding.NewMockMutableSeriesIteratorsPool(ctrl)
+	mutablePool.EXPECT().
+		Get(gomock.Any()).
+		DoAndReturn(func(size int) encoding.MutableSeriesIterators {
+			return encoding.NewSeriesIterators(make([]encoding.SeriesIterator, 0, size), mutablePool)
+		}).
+		AnyTimes()
+	mutablePool.EXPECT().Put(gomock.Any()).AnyTimes()
+
+	pools.EXPECT().MutableSeriesIterators().Return(mutablePool).AnyTimes()
+
+	return pools
 }

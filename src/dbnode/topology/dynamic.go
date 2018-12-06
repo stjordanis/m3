@@ -24,10 +24,10 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/m3db/m3/src/cluster/placement"
+	"github.com/m3db/m3/src/cluster/services"
+	"github.com/m3db/m3/src/cluster/shard"
 	"github.com/m3db/m3/src/dbnode/sharding"
-	"github.com/m3db/m3cluster/placement"
-	"github.com/m3db/m3cluster/services"
-	"github.com/m3db/m3cluster/shard"
 	xlog "github.com/m3db/m3x/log"
 	xwatch "github.com/m3db/m3x/watch"
 )
@@ -179,7 +179,8 @@ func (t *dynamicTopology) MarkShardsAvailable(
 	if err != nil {
 		return err
 	}
-	return ps.MarkShardsAvailable(instanceID, shardIDs...)
+	_, err = ps.MarkShardsAvailable(instanceID, shardIDs...)
+	return err
 }
 
 func getMapFromUpdate(data interface{}, hashGen sharding.HashGen) (Map, error) {

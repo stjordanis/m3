@@ -35,16 +35,24 @@ import (
 	"github.com/uber-go/tally"
 )
 
-type commitLogFilesFn func(commitlog.Options) ([]commitlog.File, error)
+type commitLogFilesFn func(commitlog.Options) ([]commitlog.File, []commitlog.ErrorWithPath, error)
 
 type deleteFilesFn func(files []string) error
 
 type deleteInactiveDirectoriesFn func(parentDirPath string, activeDirNames []string) error
 
+// Narrow interface so as not to expose all the functionality of the commitlog
+// to the cleanup manager.
+type activeCommitlogs interface {
+	ActiveLogs() ([]commitlog.File, error)
+}
+
 type cleanupManager struct {
 	sync.RWMutex
 
-	database                    database
+	database         database
+	activeCommitlogs activeCommitlogs
+
 	opts                        Options
 	nowFn                       clock.NowFn
 	filePathPrefix              string
@@ -53,16 +61,34 @@ type cleanupManager struct {
 	deleteFilesFn               deleteFilesFn
 	deleteInactiveDirectoriesFn deleteInactiveDirectoriesFn
 	cleanupInProgress           bool
-	status                      tally.Gauge
+	metrics                     cleanupManagerMetrics
 }
 
-func newCleanupManager(database database, scope tally.Scope) databaseCleanupManager {
+type cleanupManagerMetrics struct {
+	status               tally.Gauge
+	corruptCommitlogFile tally.Counter
+	deletedCommitlogFile tally.Counter
+}
+
+func newCleanupManagerMetrics(scope tally.Scope) cleanupManagerMetrics {
+	clScope := scope.SubScope("commitlog")
+	return cleanupManagerMetrics{
+		status:               scope.Gauge("cleanup"),
+		corruptCommitlogFile: clScope.Counter("corrupt"),
+		deletedCommitlogFile: clScope.Counter("deleted"),
+	}
+}
+
+func newCleanupManager(
+	database database, activeLogs activeCommitlogs, scope tally.Scope) databaseCleanupManager {
 	opts := database.Options()
 	filePathPrefix := opts.CommitLogOptions().FilesystemOptions().FilePathPrefix()
 	commitLogsDir := fs.CommitLogsDirPath(filePathPrefix)
 
 	return &cleanupManager{
-		database:                    database,
+		database:         database,
+		activeCommitlogs: activeLogs,
+
 		opts:                        opts,
 		nowFn:                       opts.ClockOptions().NowFn(),
 		filePathPrefix:              filePathPrefix,
@@ -70,7 +96,7 @@ func newCleanupManager(database database, scope tally.Scope) databaseCleanupMana
 		commitLogFilesFn:            commitlog.Files,
 		deleteFilesFn:               fs.DeleteFiles,
 		deleteInactiveDirectoriesFn: fs.DeleteInactiveDirectories,
-		status: scope.Gauge("cleanup"),
+		metrics:                     newCleanupManagerMetrics(scope),
 	}
 }
 
@@ -128,6 +154,7 @@ func (m *cleanupManager) Cleanup(t time.Time) error {
 			"encountered errors when cleaning up commit logs for commitLogFiles %v: %v",
 			filesToCleanup, err))
 	}
+	m.metrics.deletedCommitlogFile.Inc(int64(len(filesToCleanup)))
 
 	return multiErr.FinalError()
 }
@@ -138,9 +165,9 @@ func (m *cleanupManager) Report() {
 	m.RUnlock()
 
 	if cleanupInProgress {
-		m.status.Update(1)
+		m.metrics.status.Update(1)
 	} else {
-		m.status.Update(0)
+		m.metrics.status.Update(0)
 	}
 }
 
@@ -269,29 +296,47 @@ func (m *cleanupManager) cleanupNamespaceSnapshotFiles(earliestToRetain time.Tim
 
 // commitLogTimes returns the earliest time before which the commit logs are expired,
 // as well as a list of times we need to clean up commit log files for.
-func (m *cleanupManager) commitLogTimes(t time.Time) ([]commitlog.File, error) {
-	// NB(prateek): this logic of polling the namespaces across the commit log's entire
-	// retention history could get expensive if commit logs are retained for long periods.
-	// e.g. if we retain them for 40 days, with a block 2 hours; then every time
-	// we try to flush we are going to be polling each namespace, for each shard, for 480
-	// distinct blockstarts. Say we have 2 namespaces, each with 8192 shards, that's ~10M map lookups.
-	// If we cared about 100% correctness, we would optimize this by retaining a smarter data
-	// structure (e.g. interval tree), but for our use-case, it's safe to assume that commit logs
-	// are only retained for a period of 1-2 days (at most), after we which we'd live we with the
-	// data loss.
-
-	files, err := m.commitLogFilesFn(m.opts.CommitLogOptions())
-	if err != nil {
-		return nil, err
-	}
+func (m *cleanupManager) commitLogTimes(t time.Time) ([]commitLogFileWithErrorAndPath, error) {
 	namespaces, err := m.database.GetOwnedNamespaces()
 	if err != nil {
 		return nil, err
 	}
 
-	shouldCleanupFile := func(start time.Time, duration time.Duration) (bool, error) {
+	// We list the commit log files on disk before we determine what the currently active commitlog
+	// is to ensure that the logic remains correct even if the commitlog is rotated while this
+	// function is executing. For example, imagine the following commitlogs are on disk:
+	//
+	// [time1, time2, time3]
+	//
+	// If we call ActiveLogs first then it will return time3. Next, the commit log file rotates, and
+	// after that we call commitLogFilesFn which returns: [time1, time2, time3, time4]. In this scenario
+	// we would be allowed to delete commitlog files 1,2, and 4 which is not the desired behavior. Instead,
+	// we list the commitlogs on disk first (which returns time1, time2, and time3) and *then* check what
+	// the active file is. If the commitlog has not rotated, then ActiveLogs() will return time3 which
+	// we will correctly avoid deleting, and if the commitlog has rotated, then ActiveLogs() will return
+	// time4 which we wouldn't consider deleting anyways because it wasn't returned from the first call
+	// to commitLogFilesFn.
+	files, corruptFiles, err := m.commitLogFilesFn(m.opts.CommitLogOptions())
+	if err != nil {
+		return nil, err
+	}
+
+	activeCommitlogs, err := m.activeCommitlogs.ActiveLogs()
+	if err != nil {
+		return nil, err
+	}
+
+	shouldCleanupFile := func(f commitlog.File) (bool, error) {
+		if commitlogsContainPath(activeCommitlogs, f.FilePath) {
+			// An active commitlog should never satisfy all of the constraints
+			// for deleting a commitlog, but skip them for posterity.
+			return false, nil
+		}
+
 		for _, ns := range namespaces {
 			var (
+				start                      = f.Start
+				duration                   = f.Duration
 				ropts                      = ns.Options().RetentionOptions()
 				nsBlocksStart, nsBlocksEnd = commitLogNamespaceBlockTimes(start, duration, ropts)
 				needsFlush                 = ns.NeedsFlush(nsBlocksStart, nsBlocksEnd)
@@ -316,6 +361,8 @@ func (m *cleanupManager) commitLogTimes(t time.Time) ([]commitlog.File, error) {
 			isCapturedBySnapshot, err := ns.IsCapturedBySnapshot(
 				nsBlocksStart, nsBlocksEnd, start.Add(duration))
 			if err != nil {
+				// Return error because we don't want to proceed since this is not a commitlog
+				// file specific issue.
 				return false, err
 			}
 
@@ -332,7 +379,38 @@ func (m *cleanupManager) commitLogTimes(t time.Time) ([]commitlog.File, error) {
 		return true, nil
 	}
 
-	return filterCommitLogFiles(files, shouldCleanupFile)
+	filesToCleanup := make([]commitLogFileWithErrorAndPath, 0, len(files))
+	for _, f := range files {
+		shouldDelete, err := shouldCleanupFile(f)
+		if err != nil {
+			return nil, err
+		}
+
+		if shouldDelete {
+			filesToCleanup = append(filesToCleanup, newCommitLogFileWithErrorAndPath(
+				f, f.FilePath, nil))
+		}
+	}
+
+	for _, errorWithPath := range corruptFiles {
+		if commitlogsContainPath(activeCommitlogs, errorWithPath.Path()) {
+			// Skip active commit log files as they may appear corrupt due to the
+			// header info not being written out yet.
+			continue
+		}
+
+		m.metrics.corruptCommitlogFile.Inc(1)
+		// If we were unable to read the commit log files info header, then we're forced to assume
+		// that the file is corrupt and remove it. This can happen in situations where M3DB experiences
+		// sudden shutdown.
+		m.opts.InstrumentOptions().Logger().Errorf(
+			"encountered corrupt commitlog file during cleanup, marking file for deletion: %s",
+			errorWithPath.Error())
+		filesToCleanup = append(filesToCleanup, newCommitLogFileWithErrorAndPath(
+			commitlog.File{}, errorWithPath.Path(), err))
+	}
+
+	return filesToCleanup, nil
 }
 
 // commitLogNamespaceBlockTimes returns the range of namespace block starts for which the
@@ -365,10 +443,35 @@ func commitLogNamespaceBlockTimes(
 	return earliest, latest
 }
 
-func (m *cleanupManager) cleanupCommitLogs(filesToCleanup []commitlog.File) error {
+func (m *cleanupManager) cleanupCommitLogs(filesToCleanup []commitLogFileWithErrorAndPath) error {
 	filesToDelete := make([]string, 0, len(filesToCleanup))
 	for _, f := range filesToCleanup {
-		filesToDelete = append(filesToDelete, f.FilePath)
+		filesToDelete = append(filesToDelete, f.path)
 	}
 	return m.deleteFilesFn(filesToDelete)
+}
+
+type commitLogFileWithErrorAndPath struct {
+	f    commitlog.File
+	path string
+	err  error
+}
+
+func newCommitLogFileWithErrorAndPath(
+	f commitlog.File, path string, err error) commitLogFileWithErrorAndPath {
+	return commitLogFileWithErrorAndPath{
+		f:    f,
+		path: path,
+		err:  err,
+	}
+}
+
+func commitlogsContainPath(commitlogs []commitlog.File, path string) bool {
+	for _, f := range commitlogs {
+		if path == f.FilePath {
+			return true
+		}
+	}
+
+	return false
 }

@@ -1,0 +1,80 @@
+common: &common
+  agents:
+    queue: monorepo
+  retry:
+    # Automatically retry failures one time.
+    automatic:
+      limit: 1
+    # Allow manual retries.
+    manual: true
+
+# Environment variables to apply to all steps.
+env:
+  # Per-step
+  BUILDKITE_TIMEOUT: 20 # Minutes
+
+steps:
+  - name: "Codegen"
+    command: make clean install-vendor test-all-gen
+    env:
+      CGO_ENABLED: 0
+      GIMME_GO_VERSION: 1.10.x
+    plugins:
+        gopath-checkout#v1.0.1:
+          import: github.com/m3db/m3
+    <<: *common
+  - name: "Unit"
+    command: make clean install-vendor test-ci-unit
+    plugins:
+      docker-compose#v2.5.1:
+        run: app
+        workdir: /go/src/github.com/m3db/m3
+    <<: *common
+  - name: "Big Unit"
+    command: make clean install-vendor test-ci-big-unit
+    plugins:
+      docker-compose#v2.5.1:
+        run: app
+        workdir: /go/src/github.com/m3db/m3
+    <<: *common
+  - name: "Integration (:docker:), Services, Tools, Metalint"
+    command: make install-vendor metalint docker-integration-test tools services
+    env:
+      CGO_ENABLED: 0
+      GIMME_GO_VERSION: 1.10.x
+    plugins:
+        gopath-checkout#v1.0.1:
+          import: github.com/m3db/m3
+    <<: *common
+  - name: "Integration (dbnode Recently Read) %n"
+    parallelism: 2
+    command: make clean install-vendor test-ci-integration-dbnode cache_policy=recently_read
+    plugins:
+      docker-compose#v2.5.1:
+        run: app
+        workdir: /go/src/github.com/m3db/m3
+    <<: *common
+  - name: "Integration (dbnode LRU) %n"
+    parallelism: 2
+    command: make clean install-vendor test-ci-integration-dbnode cache_policy=lru
+    plugins:
+      docker-compose#v2.5.1:
+        run: app
+        workdir: /go/src/github.com/m3db/m3
+    <<: *common
+  - label: "Integration (collector, aggregator, m3em, cluster, msg, metrics) %n"
+    parallelism: 2
+    command: make clean install-vendor test-ci-integration-collector test-ci-integration-aggregator test-ci-integration-m3em test-ci-integration-cluster test-ci-integration-msg test-ci-integration-metrics
+    plugins:
+      docker-compose#v2.5.1:
+        run: app
+        workdir: /go/src/github.com/m3db/m3
+    <<: *common
+  - label: "FOSSA license scan"
+    command: make clean install-vendor fossa
+    plugins:
+      docker-compose#v2.5.1:
+        run: app
+        workdir: /go/src/github.com/m3db/m3
+        env:
+          - FOSSA_API_KEY

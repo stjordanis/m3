@@ -68,15 +68,15 @@ func TestCleanupManagerCleanup(t *testing.T) {
 	}
 	db := newMockdatabase(ctrl, namespaces...)
 	db.EXPECT().GetOwnedNamespaces().Return(namespaces, nil).AnyTimes()
-	mgr := newCleanupManager(db, tally.NoopScope).(*cleanupManager)
+	mgr := newCleanupManager(db, newNoopFakeActiveLogs(), tally.NoopScope).(*cleanupManager)
 	mgr.opts = mgr.opts.SetCommitLogOptions(
 		mgr.opts.CommitLogOptions().
 			SetBlockSize(rOpts.BlockSize()))
 
-	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, error) {
+	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, []commitlog.ErrorWithPath, error) {
 		return []commitlog.File{
-			commitlog.File{FilePath: "foo", Start: timeFor(14400)},
-		}, nil
+			{FilePath: "foo", Start: timeFor(14400)},
+		}, nil, nil
 	}
 	var deletedFiles []string
 	mgr.deleteFilesFn = func(files []string) error {
@@ -116,7 +116,7 @@ func TestCleanupManagerNamespaceCleanup(t *testing.T) {
 	db := newMockdatabase(ctrl, ns)
 	db.EXPECT().GetOwnedNamespaces().Return(nses, nil).AnyTimes()
 
-	mgr := newCleanupManager(db, tally.NoopScope).(*cleanupManager)
+	mgr := newCleanupManager(db, newNoopFakeActiveLogs(), tally.NoopScope).(*cleanupManager)
 	idx.EXPECT().CleanupExpiredFileSets(ts).Return(nil)
 	require.NoError(t, mgr.Cleanup(ts))
 }
@@ -140,7 +140,7 @@ func TestCleanupManagerDoesntNeedCleanup(t *testing.T) {
 	}
 	db := newMockdatabase(ctrl, namespaces...)
 	db.EXPECT().GetOwnedNamespaces().Return(namespaces, nil).AnyTimes()
-	mgr := newCleanupManager(db, tally.NoopScope).(*cleanupManager)
+	mgr := newCleanupManager(db, newNoopFakeActiveLogs(), tally.NoopScope).(*cleanupManager)
 	mgr.opts = mgr.opts.SetCommitLogOptions(
 		mgr.opts.CommitLogOptions().
 			SetBlockSize(rOpts.BlockSize()))
@@ -175,7 +175,7 @@ func TestCleanupDataAndSnapshotFileSetFiles(t *testing.T) {
 
 	db := newMockdatabase(ctrl, namespaces...)
 	db.EXPECT().GetOwnedNamespaces().Return(namespaces, nil).AnyTimes()
-	mgr := newCleanupManager(db, tally.NoopScope).(*cleanupManager)
+	mgr := newCleanupManager(db, newNoopFakeActiveLogs(), tally.NoopScope).(*cleanupManager)
 
 	require.NoError(t, mgr.Cleanup(ts))
 }
@@ -204,7 +204,7 @@ func TestDeleteInactiveDataAndSnapshotFileSetFiles(t *testing.T) {
 
 	db := newMockdatabase(ctrl, namespaces...)
 	db.EXPECT().GetOwnedNamespaces().Return(namespaces, nil).AnyTimes()
-	mgr := newCleanupManager(db, tally.NoopScope).(*cleanupManager)
+	mgr := newCleanupManager(db, newNoopFakeActiveLogs(), tally.NoopScope).(*cleanupManager)
 
 	deleteInactiveDirectoriesCalls := []deleteInactiveDirectoriesCall{}
 	deleteInactiveDirectoriesFn := func(parentDirPath string, activeDirNames []string) error {
@@ -257,7 +257,7 @@ func TestCleanupManagerPropagatesGetOwnedNamespacesError(t *testing.T) {
 	db.EXPECT().Terminate().Return(nil)
 	db.EXPECT().GetOwnedNamespaces().Return(nil, errDatabaseIsClosed).AnyTimes()
 
-	mgr := newCleanupManager(db, tally.NoopScope).(*cleanupManager)
+	mgr := newCleanupManager(db, newNoopFakeActiveLogs(), tally.NoopScope).(*cleanupManager)
 	require.NoError(t, db.Open())
 	require.NoError(t, db.Terminate())
 
@@ -436,7 +436,7 @@ func newCleanupManagerCommitLogTimesTest(t *testing.T, ctrl *gomock.Controller) 
 	ns.EXPECT().Options().Return(no).AnyTimes()
 
 	db := newMockdatabase(ctrl, ns)
-	mgr := newCleanupManager(db, tally.NoopScope).(*cleanupManager)
+	mgr := newCleanupManager(db, newNoopFakeActiveLogs(), tally.NoopScope).(*cleanupManager)
 
 	mgr.opts = mgr.opts.SetCommitLogOptions(
 		mgr.opts.CommitLogOptions().
@@ -465,7 +465,7 @@ func newCleanupManagerCommitLogTimesTestMultiNS(
 	ns2.EXPECT().Options().Return(no).AnyTimes()
 
 	db := newMockdatabase(ctrl, ns1, ns2)
-	mgr := newCleanupManager(db, tally.NoopScope).(*cleanupManager)
+	mgr := newCleanupManager(db, newNoopFakeActiveLogs(), tally.NoopScope).(*cleanupManager)
 
 	mgr.opts = mgr.opts.SetCommitLogOptions(
 		mgr.opts.CommitLogOptions().
@@ -478,12 +478,12 @@ func TestCleanupManagerCommitLogTimesAllFlushed(t *testing.T) {
 	defer ctrl.Finish()
 
 	ns, mgr := newCleanupManagerCommitLogTimesTest(t, ctrl)
-	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, error) {
+	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, []commitlog.ErrorWithPath, error) {
 		return []commitlog.File{
 			commitlog.File{Start: time10, Duration: commitLogBlockSize},
 			commitlog.File{Start: time20, Duration: commitLogBlockSize},
 			commitlog.File{Start: time30, Duration: commitLogBlockSize},
-		}, nil
+		}, nil, nil
 	}
 
 	gomock.InOrder(
@@ -505,12 +505,12 @@ func TestCleanupManagerCommitLogTimesMiddlePendingFlush(t *testing.T) {
 	defer ctrl.Finish()
 
 	ns, mgr := newCleanupManagerCommitLogTimesTest(t, ctrl)
-	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, error) {
+	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, []commitlog.ErrorWithPath, error) {
 		return []commitlog.File{
 			commitlog.File{Start: time10, Duration: commitLogBlockSize},
 			commitlog.File{Start: time20, Duration: commitLogBlockSize},
 			commitlog.File{Start: time30, Duration: commitLogBlockSize},
-		}, nil
+		}, nil, nil
 	}
 
 	ns.EXPECT().IsCapturedBySnapshot(
@@ -533,12 +533,12 @@ func TestCleanupManagerCommitLogTimesStartPendingFlush(t *testing.T) {
 	defer ctrl.Finish()
 
 	ns, mgr := newCleanupManagerCommitLogTimesTest(t, ctrl)
-	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, error) {
+	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, []commitlog.ErrorWithPath, error) {
 		return []commitlog.File{
 			commitlog.File{Start: time10, Duration: commitLogBlockSize},
 			commitlog.File{Start: time20, Duration: commitLogBlockSize},
 			commitlog.File{Start: time30, Duration: commitLogBlockSize},
-		}, nil
+		}, nil, nil
 	}
 
 	ns.EXPECT().IsCapturedBySnapshot(
@@ -562,12 +562,12 @@ func TestCleanupManagerCommitLogTimesAllPendingFlush(t *testing.T) {
 	defer ctrl.Finish()
 
 	ns, mgr := newCleanupManagerCommitLogTimesTest(t, ctrl)
-	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, error) {
+	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, []commitlog.ErrorWithPath, error) {
 		return []commitlog.File{
 			commitlog.File{Start: time10, Duration: commitLogBlockSize},
 			commitlog.File{Start: time20, Duration: commitLogBlockSize},
 			commitlog.File{Start: time30, Duration: commitLogBlockSize},
-		}, nil
+		}, nil, nil
 	}
 
 	ns.EXPECT().IsCapturedBySnapshot(
@@ -587,12 +587,22 @@ func timeFor(s int64) time.Time {
 	return time.Unix(s, 0)
 }
 
-func contains(arr []commitlog.File, t time.Time) bool {
+func contains(arr []commitLogFileWithErrorAndPath, t time.Time) bool {
 	for _, at := range arr {
-		if at.Start.Equal(t) {
+		if at.f.Start.Equal(t) {
 			return true
 		}
 	}
+	return false
+}
+
+func containsCorrupt(arr []commitLogFileWithErrorAndPath, path string) bool {
+	for _, f := range arr {
+		if f.path == path {
+			return true
+		}
+	}
+
 	return false
 }
 
@@ -605,12 +615,12 @@ func TestCleanupManagerCommitLogTimesAllPendingFlushButHaveSnapshot(t *testing.T
 		currentTime        = timeFor(50)
 		commitLogBlockSize = 10 * time.Second
 	)
-	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, error) {
+	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, []commitlog.ErrorWithPath, error) {
 		return []commitlog.File{
 			commitlog.File{Start: time10, Duration: commitLogBlockSize},
 			commitlog.File{Start: time20, Duration: commitLogBlockSize},
 			commitlog.File{Start: time30, Duration: commitLogBlockSize},
-		}, nil
+		}, nil, nil
 	}
 
 	gomock.InOrder(
@@ -646,10 +656,10 @@ func TestCleanupManagerCommitLogTimesHandlesIsCapturedBySnapshotError(t *testing
 	defer ctrl.Finish()
 
 	ns, mgr := newCleanupManagerCommitLogTimesTest(t, ctrl)
-	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, error) {
+	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, []commitlog.ErrorWithPath, error) {
 		return []commitlog.File{
 			commitlog.File{Start: time30, Duration: commitLogBlockSize},
-		}, nil
+		}, nil, nil
 	}
 
 	gomock.InOrder(
@@ -667,12 +677,12 @@ func TestCleanupManagerCommitLogTimesMultiNS(t *testing.T) {
 	defer ctrl.Finish()
 
 	ns1, ns2, mgr := newCleanupManagerCommitLogTimesTestMultiNS(t, ctrl)
-	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, error) {
+	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, []commitlog.ErrorWithPath, error) {
 		return []commitlog.File{
 			commitlog.File{Start: time10, Duration: commitLogBlockSize},
 			commitlog.File{Start: time20, Duration: commitLogBlockSize},
 			commitlog.File{Start: time30, Duration: commitLogBlockSize},
-		}, nil
+		}, nil, nil
 	}
 
 	// ns1 is flushed for time10->time20 and time20->time30.
@@ -709,4 +719,65 @@ func TestCleanupManagerCommitLogTimesMultiNS(t *testing.T) {
 	// time so the file needs to be retained.
 	require.True(t, contains(filesToCleanup, time10))
 	require.True(t, contains(filesToCleanup, time20))
+}
+
+func TestCleanupManagerDeletesCorruptCommitLogFiles(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	var (
+		_, mgr = newCleanupManagerCommitLogTimesTest(t, ctrl)
+		err    = errors.New("some_error")
+		path   = "path"
+	)
+	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, []commitlog.ErrorWithPath, error) {
+		return []commitlog.File{}, []commitlog.ErrorWithPath{
+			commitlog.NewErrorWithPath(err, path),
+		}, nil
+	}
+
+	filesToCleanup, err := mgr.commitLogTimes(currentTime)
+	require.NoError(t, err)
+	require.True(t, containsCorrupt(filesToCleanup, path))
+}
+
+func TestCleanupManagerIgnoresActiveCommitLogFiles(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	var (
+		_, mgr = newCleanupManagerCommitLogTimesTest(t, ctrl)
+		err    = errors.New("some_error")
+		path   = "path"
+	)
+	mgr.commitLogFilesFn = func(_ commitlog.Options) ([]commitlog.File, []commitlog.ErrorWithPath, error) {
+		return []commitlog.File{}, []commitlog.ErrorWithPath{
+			commitlog.NewErrorWithPath(err, path),
+		}, nil
+	}
+	mgr.activeCommitlogs = newFakeActiveLogs([]commitlog.File{
+		{FilePath: path},
+	})
+
+	filesToCleanup, err := mgr.commitLogTimes(currentTime)
+	require.NoError(t, err)
+	require.Empty(t, filesToCleanup, path)
+}
+
+type fakeActiveLogs struct {
+	activeLogs []commitlog.File
+}
+
+func (f fakeActiveLogs) ActiveLogs() ([]commitlog.File, error) {
+	return f.activeLogs, nil
+}
+
+func newNoopFakeActiveLogs() fakeActiveLogs {
+	return newFakeActiveLogs(nil)
+}
+
+func newFakeActiveLogs(activeLogs []commitlog.File) fakeActiveLogs {
+	return fakeActiveLogs{
+		activeLogs: activeLogs,
+	}
 }

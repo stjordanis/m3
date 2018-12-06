@@ -31,6 +31,7 @@ import (
 
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
+	"github.com/uber-go/tally"
 )
 
 func TestExecute(t *testing.T) {
@@ -38,13 +39,12 @@ func TestExecute(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	store, session := m3.NewStorageAndSession(t, ctrl)
 	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, false, fmt.Errorf("dummy"))
+	session.EXPECT().IteratorPools().Return(nil, nil)
 
 	// Results is closed by execute
 	results := make(chan *storage.QueryResult)
-	closing := make(chan bool)
-
-	engine := NewEngine(store)
-	go engine.Execute(context.TODO(), &storage.FetchQuery{}, &EngineOptions{}, closing, results)
-	<-results
-	assert.Equal(t, len(engine.tracker.queries), 1)
+	engine := NewEngine(store, tally.NewTestScope("test", nil))
+	go engine.Execute(context.TODO(), &storage.FetchQuery{}, &EngineOptions{}, results)
+	res := <-results
+	assert.NotNil(t, res.Err)
 }

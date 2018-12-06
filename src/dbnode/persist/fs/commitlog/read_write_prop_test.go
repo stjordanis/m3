@@ -23,6 +23,7 @@
 package commitlog
 
 import (
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -33,6 +34,8 @@ import (
 	"time"
 
 	"github.com/m3db/m3/src/dbnode/ts"
+	"github.com/m3db/m3/src/x/os"
+	xtest "github.com/m3db/m3/src/x/test"
 	"github.com/m3db/m3x/context"
 	"github.com/m3db/m3x/ident"
 	xtime "github.com/m3db/m3x/time"
@@ -85,8 +88,9 @@ func TestCommitLogReadWrite(t *testing.T) {
 		FileFilterPredicate:   ReadAllPredicate(),
 		SeriesFilterPredicate: ReadAllSeriesPredicate(),
 	}
-	iter, err := NewIterator(iterOpts)
+	iter, corruptFiles, err := NewIterator(iterOpts)
 	require.NoError(t, err)
+	require.True(t, len(corruptFiles) == 0)
 	defer iter.Close()
 
 	// Convert the writes to be in-order, but keyed by series ID because the
@@ -121,24 +125,49 @@ func TestCommitLogReadWrite(t *testing.T) {
 	require.Equal(t, len(writes), i)
 }
 
+// TestCommitLogPropTest property tests the commitlog by performing various
+// operations (Open, Write, Close) in various orders, and then ensuring that
+// all the data can be read back. In addition, in some runs it will arbitrarily
+// (based on a randomly generate probability) corrupt any bytes written to disk by
+// the commitlog to ensure that the commitlog reader is resilient to arbitrarily
+// corrupted files and will not deadlock / panic.
 func TestCommitLogPropTest(t *testing.T) {
+	// Temporarily reduce size of buffered channels to increase chance of
+	// catching deadlock issues.
+	var (
+		oldDecoderInBufChanSize  = decoderInBufChanSize
+		oldDecoderOutBufChanSize = decoderOutBufChanSize
+	)
+	defer func() {
+		decoderInBufChanSize = oldDecoderInBufChanSize
+		decoderOutBufChanSize = oldDecoderOutBufChanSize
+	}()
+	decoderInBufChanSize = 0
+	decoderOutBufChanSize = 0
+
 	basePath, err := ioutil.TempDir("", "commit-log-tests")
 	require.NoError(t, err)
 	defer os.RemoveAll(basePath)
 
-	parameters := gopter.DefaultTestParameters()
-	parameters.MinSuccessfulTests = 8
+	var (
+		seed       = time.Now().Unix()
+		parameters = gopter.DefaultTestParametersWithSeed(seed)
+		reporter   = gopter.NewFormatedReporter(true, 160, os.Stdout)
+	)
+	parameters.MinSuccessfulTests = 20
 	properties := gopter.NewProperties(parameters)
 
-	comms := clCommandFunctor(basePath, t)
+	comms := clCommandFunctor(t, basePath, seed)
 	properties.Property("CommitLog System", commands.Prop(comms))
-	properties.TestingRun(t)
+	if !properties.Run(reporter) {
+		t.Errorf("failed with initial seed: %d", seed)
+	}
 }
 
 // clCommandFunctor is a var which implements the command.Commands interface,
 // i.e. is responsible for creating/destroying the system under test and generating
 // commands and initial states (clState)
-func clCommandFunctor(basePath string, t *testing.T) *commands.ProtoCommands {
+func clCommandFunctor(t *testing.T, basePath string, seed int64) *commands.ProtoCommands {
 	return &commands.ProtoCommands{
 		NewSystemUnderTestFunc: func(initialState commands.State) commands.SystemUnderTest {
 			return initialState
@@ -150,7 +179,7 @@ func clCommandFunctor(basePath string, t *testing.T) *commands.ProtoCommands {
 			}
 			os.RemoveAll(state.opts.FilesystemOptions().FilePathPrefix())
 		},
-		InitialStateGen: genState(basePath, t),
+		InitialStateGen: genState(t, basePath, seed),
 		InitialPreConditionFunc: func(state commands.State) bool {
 			if state == nil {
 				return false
@@ -159,7 +188,13 @@ func clCommandFunctor(basePath string, t *testing.T) *commands.ProtoCommands {
 			return ok
 		},
 		GenCommandFunc: func(state commands.State) gopter.Gen {
-			return gen.OneGenOf(genOpenCommand, genCloseCommand, genWriteBehindCommand)
+			return gen.OneGenOf(
+				genOpenCommand,
+				genCloseCommand,
+				genWriteBehindCommand,
+				genActiveLogsCommand,
+				genRotateLogsCommand,
+			)
 		},
 	}
 }
@@ -178,7 +213,26 @@ var genOpenCommand = gen.Const(&commands.ProtoCommand{
 		if err != nil {
 			return err
 		}
-		return s.cLog.Open()
+
+		if s.shouldCorrupt {
+			cLog := s.cLog.(*commitLog)
+			cLog.newCommitLogWriterFn = func(flushFn flushFn, opts Options) commitLogWriter {
+				wIface := newCommitLogWriter(flushFn, opts)
+				w := wIface.(*writer)
+				w.chunkWriter = newCorruptingChunkWriter(
+					w.chunkWriter.(*fsChunkWriter),
+					s.corruptionProbability,
+					s.seed,
+				)
+				return w
+			}
+		}
+		err = s.cLog.Open()
+		if err != nil {
+			return err
+		}
+		s.open = true
+		return nil
 	},
 	NextStateFunc: func(state commands.State) commands.State {
 		s := state.(*clState)
@@ -203,12 +257,16 @@ var genCloseCommand = gen.Const(&commands.ProtoCommand{
 	},
 	RunFunc: func(q commands.SystemUnderTest) commands.Result {
 		s := q.(*clState)
-		return s.cLog.Close()
+		err := s.cLog.Close()
+		if err != nil {
+			return err
+		}
+		s.open = false
+		return nil
 	},
 	NextStateFunc: func(state commands.State) commands.State {
 		s := state.(*clState)
 		s.open = false
-		s.cLog = nil
 		return s
 	},
 	PostConditionFunc: func(state commands.State, result commands.Result) *gopter.PropResult {
@@ -230,8 +288,8 @@ var genCloseCommand = gen.Const(&commands.ProtoCommand{
 	},
 })
 
-var genWriteBehindCommand = genWrite().
-	Map(func(w generatedWrite) commands.Command {
+var genWriteBehindCommand = gen.SliceOfN(10, genWrite()).
+	Map(func(writes []generatedWrite) commands.Command {
 		return &commands.ProtoCommand{
 			Name: "WriteBehind",
 			PreConditionFunc: func(state commands.State) bool {
@@ -241,11 +299,19 @@ var genWriteBehindCommand = genWrite().
 				s := q.(*clState)
 				ctx := context.NewContext()
 				defer ctx.Close()
-				return s.cLog.Write(ctx, w.series, w.datapoint, w.unit, w.annotation)
+
+				for _, w := range writes {
+					err := s.cLog.Write(ctx, w.series, w.datapoint, w.unit, w.annotation)
+					if err != nil {
+						return err
+					}
+				}
+
+				return nil
 			},
 			NextStateFunc: func(state commands.State) commands.State {
 				s := state.(*clState)
-				s.pendingWrites = append(s.pendingWrites, w)
+				s.pendingWrites = append(s.pendingWrites, writes...)
 				return s
 			},
 			PostConditionFunc: func(state commands.State, result commands.Result) *gopter.PropResult {
@@ -260,6 +326,92 @@ var genWriteBehindCommand = genWrite().
 		}
 	})
 
+var genActiveLogsCommand = gen.Const(&commands.ProtoCommand{
+	Name: "ActiveLogs",
+	PreConditionFunc: func(state commands.State) bool {
+		return true
+	},
+	RunFunc: func(q commands.SystemUnderTest) commands.Result {
+		s := q.(*clState)
+
+		if s.cLog == nil {
+			return nil
+		}
+
+		logs, err := s.cLog.ActiveLogs()
+		if !s.open {
+			if err != errCommitLogClosed {
+				return errors.New("did not receive commit log closed error")
+			}
+			return nil
+		}
+
+		if err != nil {
+			return err
+		}
+
+		if len(logs) != 1 {
+			return fmt.Errorf("ActiveLogs did not return exactly one log file: %v", logs)
+		}
+
+		return nil
+	},
+	NextStateFunc: func(state commands.State) commands.State {
+		s := state.(*clState)
+		return s
+	},
+	PostConditionFunc: func(state commands.State, result commands.Result) *gopter.PropResult {
+		if result == nil {
+			return &gopter.PropResult{Status: gopter.PropTrue}
+		}
+		return &gopter.PropResult{
+			Status: gopter.PropFalse,
+			Error:  result.(error),
+		}
+	},
+})
+
+var genRotateLogsCommand = gen.Const(&commands.ProtoCommand{
+	Name: "RotateLogs",
+	PreConditionFunc: func(state commands.State) bool {
+		return true
+	},
+	RunFunc: func(q commands.SystemUnderTest) commands.Result {
+		s := q.(*clState)
+
+		if s.cLog == nil {
+			return nil
+		}
+
+		_, err := s.cLog.RotateLogs()
+		if !s.open {
+			if err != errCommitLogClosed {
+				return errors.New("did not receive commit log closed error")
+			}
+			return nil
+		}
+
+		if err != nil {
+			return err
+		}
+
+		return nil
+	},
+	NextStateFunc: func(state commands.State) commands.State {
+		s := state.(*clState)
+		return s
+	},
+	PostConditionFunc: func(state commands.State, result commands.Result) *gopter.PropResult {
+		if result == nil {
+			return &gopter.PropResult{Status: gopter.PropTrue}
+		}
+		return &gopter.PropResult{
+			Status: gopter.PropFalse,
+			Error:  result.(error),
+		}
+	},
+})
+
 // clState holds the expected state (i.e. its the commands.State), and we use it as the SystemUnderTest
 type clState struct {
 	basePath      string
@@ -267,27 +419,46 @@ type clState struct {
 	open          bool
 	cLog          CommitLog
 	pendingWrites []generatedWrite
+	// Whether the test should corrupt the commit log.
+	shouldCorrupt bool
+	// If the test should corrupt the commit log, what is the probability of
+	// corruption for any given write.
+	corruptionProbability float64
+	// Seed for use with all RNGs so that runs are reproducible.
+	seed int64
 }
 
 // generator for commit log write
-func genState(basePath string, t *testing.T) gopter.Gen {
-	return gen.Identifier().
+func genState(t *testing.T, basePath string, seed int64) gopter.Gen {
+	return gopter.CombineGens(gen.Identifier(), gen.Bool(), gen.Float64Range(0, 1)).
 		MapResult(func(r *gopter.GenResult) *gopter.GenResult {
 			iface, ok := r.Retrieve()
 			if !ok {
 				return gopter.NewEmptyResult(reflect.PtrTo(reflect.TypeOf(clState{})))
 			}
-			p, ok := iface.(string)
+			p, ok := iface.([]interface{})
 			if !ok {
 				return gopter.NewEmptyResult(reflect.PtrTo(reflect.TypeOf(clState{})))
 			}
-			initPath := path.Join(basePath, p)
-			result := newInitState(initPath, t)
+
+			var (
+				initPath              = path.Join(basePath, p[0].(string))
+				shouldCorrupt         = p[1].(bool)
+				corruptionProbability = p[2].(float64)
+				result                = newInitState(
+					t, initPath, shouldCorrupt, corruptionProbability, seed)
+			)
 			return gopter.NewGenResult(result, gopter.NoShrinker)
 		})
 }
 
-func newInitState(dir string, t *testing.T) *clState {
+func newInitState(
+	t *testing.T,
+	dir string,
+	shouldCorrupt bool,
+	corruptionProbability float64,
+	seed int64,
+) *clState {
 	opts := NewOptions().
 		SetStrategy(StrategyWriteBehind).
 		SetFlushInterval(defaultTestFlushInterval).
@@ -298,8 +469,11 @@ func newInitState(dir string, t *testing.T) *clState {
 	fsOpts := opts.FilesystemOptions().SetFilePathPrefix(dir)
 	opts = opts.SetFilesystemOptions(fsOpts)
 	return &clState{
-		basePath: dir,
-		opts:     opts,
+		basePath:              dir,
+		opts:                  opts,
+		shouldCorrupt:         shouldCorrupt,
+		corruptionProbability: corruptionProbability,
+		seed: seed,
 	}
 }
 
@@ -310,12 +484,19 @@ func (s *clState) writesArePresent(writes ...generatedWrite) error {
 		FileFilterPredicate:   ReadAllPredicate(),
 		SeriesFilterPredicate: ReadAllSeriesPredicate(),
 	}
-	iter, err := NewIterator(iterOpts)
+	// Based on the corruption type this could return some corrupt files
+	// or it could not, so we don't check it.
+	iter, _, err := NewIterator(iterOpts)
 	if err != nil {
+		if s.shouldCorrupt {
+			return nil
+		}
 		return err
 	}
 
 	defer iter.Close()
+
+	count := 0
 	for iter.Next() {
 		series, datapoint, unit, annotation := iter.Current()
 		idString := series.ID.String()
@@ -330,9 +511,15 @@ func (s *clState) writesArePresent(writes ...generatedWrite) error {
 			unit:       unit,
 			annotation: annotation,
 		}
+		count++
 	}
+
+	if s.shouldCorrupt {
+		return nil
+	}
+
 	if err := iter.Err(); err != nil {
-		return err
+		return fmt.Errorf("failed after reading %d datapoints: %v", count, err)
 	}
 
 	missingErr := fmt.Errorf("writesOnDisk: %+v, writes: %+v", writesOnDisk, writes)
@@ -356,7 +543,7 @@ func (s *clState) writesArePresent(writes ...generatedWrite) error {
 }
 
 type generatedWrite struct {
-	series     Series
+	series     ts.Series
 	datapoint  ts.Datapoint
 	unit       xtime.Unit
 	annotation ts.Annotation
@@ -382,7 +569,7 @@ func genWrite() gopter.Gen {
 		shard := val[4].(uint32)
 
 		return generatedWrite{
-			series: Series{
+			series: ts.Series{
 				ID:          ident.StringID(id),
 				Namespace:   ident.StringID(ns),
 				Shard:       shard,
@@ -432,4 +619,45 @@ func uniqueID(ns, s string) uint64 {
 
 	nsMap[s] = idx
 	return idx
+}
+
+// corruptingChunkWriter implements the chunkWriter interface and can corrupt all writes issued
+// to it based on a configurable probability.
+type corruptingChunkWriter struct {
+	chunkWriter           *fsChunkWriter
+	corruptionProbability float64
+	seed                  int64
+}
+
+func newCorruptingChunkWriter(
+	chunkWriter *fsChunkWriter,
+	corruptionProbability float64,
+	seed int64,
+) chunkWriter {
+	return &corruptingChunkWriter{
+		chunkWriter:           chunkWriter,
+		corruptionProbability: corruptionProbability,
+		seed: seed,
+	}
+}
+
+func (c *corruptingChunkWriter) reset(f xos.File) {
+	c.chunkWriter.fd = xtest.NewCorruptingFile(
+		f, c.corruptionProbability, c.seed)
+}
+
+func (c *corruptingChunkWriter) Write(p []byte) (int, error) {
+	return c.chunkWriter.Write(p)
+}
+
+func (c *corruptingChunkWriter) close() error {
+	return c.chunkWriter.close()
+}
+
+func (c *corruptingChunkWriter) isOpen() bool {
+	return c.chunkWriter.isOpen()
+}
+
+func (c *corruptingChunkWriter) sync() error {
+	return c.chunkWriter.sync()
 }

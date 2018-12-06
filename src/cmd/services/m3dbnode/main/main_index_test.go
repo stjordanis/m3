@@ -30,15 +30,15 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/m3db/m3/src/cluster/integration/etcd"
+	"github.com/m3db/m3/src/cluster/placement"
+	"github.com/m3db/m3/src/cluster/services"
 	"github.com/m3db/m3/src/cmd/services/m3dbnode/config"
 	"github.com/m3db/m3/src/dbnode/client"
 	"github.com/m3db/m3/src/dbnode/kvconfig"
 	"github.com/m3db/m3/src/dbnode/server"
 	"github.com/m3db/m3/src/dbnode/storage/index"
 	m3ninxidx "github.com/m3db/m3/src/m3ninx/idx"
-	"github.com/m3db/m3cluster/integration/etcd"
-	"github.com/m3db/m3cluster/placement"
-	"github.com/m3db/m3cluster/services"
 	xconfig "github.com/m3db/m3x/config"
 	"github.com/m3db/m3x/ident"
 	"github.com/m3db/m3x/instrument"
@@ -196,7 +196,6 @@ func TestIndexEnabledServer(t *testing.T) {
 	// Cast to narrower-interface instead of grabbing DefaultSession to make sure
 	// we use the same topology.Map that we validated in waitUntilAllShardsAreAvailable.
 	session := adminSession.(client.Session)
-
 	defer session.Close()
 
 	start := time.Now().Add(-time.Minute)

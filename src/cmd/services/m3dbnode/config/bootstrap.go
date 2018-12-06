@@ -36,6 +36,7 @@ import (
 	"github.com/m3db/m3/src/dbnode/storage/bootstrap/bootstrapper/uninitialized"
 	"github.com/m3db/m3/src/dbnode/storage/bootstrap/result"
 	"github.com/m3db/m3/src/dbnode/storage/index"
+	"github.com/m3db/m3/src/dbnode/topology"
 )
 
 var (
@@ -52,8 +53,8 @@ type BootstrapConfiguration struct {
 	// Filesystem bootstrapper configuration.
 	Filesystem *BootstrapFilesystemConfiguration `yaml:"fs"`
 
-	// Peers bootstrapper configuration.
-	Peers *BootstrapPeersConfiguration `yaml:"peers"`
+	// Commitlog bootstrapper configuration.
+	Commitlog *BootstrapCommitlogConfiguration `yaml:"commitlog"`
 
 	// CacheSeriesMetadata determines whether individual bootstrappers cache
 	// series metadata across all calls (namespaces / shards / blocks).
@@ -68,31 +69,28 @@ func (bsc BootstrapConfiguration) fsNumProcessors() int {
 	return int(math.Ceil(float64(runtime.NumCPU()) * np))
 }
 
-// TODO: Remove once v1 endpoint no longer required.
-func (bsc BootstrapConfiguration) peersFetchBlocksMetadataEndpointVersion() client.FetchBlocksMetadataEndpointVersion {
-	version := client.FetchBlocksMetadataEndpointDefault
-	if peersCfg := bsc.Peers; peersCfg != nil {
-		version = peersCfg.FetchBlocksMetadataEndpointVersion
-	}
-	return version
-}
-
 // BootstrapFilesystemConfiguration specifies config for the fs bootstrapper.
 type BootstrapFilesystemConfiguration struct {
 	// NumProcessorsPerCPU is the number of processors per CPU.
 	NumProcessorsPerCPU float64 `yaml:"numProcessorsPerCPU" validate:"min=0.0"`
 }
 
-// BootstrapPeersConfiguration specifies config for the peers bootstrapper.
-type BootstrapPeersConfiguration struct {
-	// FetchBlocksMetadataEndpointVersion is the endpoint to use when fetching blocks metadata.
-	// TODO: Remove once v1 endpoint no longer required.
-	FetchBlocksMetadataEndpointVersion client.FetchBlocksMetadataEndpointVersion `yaml:"fetchBlocksMetadataEndpointVersion"`
+// BootstrapCommitlogConfiguration specifies config for the commitlog bootstrapper.
+type BootstrapCommitlogConfiguration struct {
+	// ReturnUnfulfilledForCorruptCommitlogFiles controls whether the commitlog bootstrapper
+	// will return unfulfilled for all shard time ranges when it encounters a corrupt commit
+	// file. Note that regardless of this value, the commitlog bootstrapper will still try and
+	// read all the uncorrupted commitlog files and return as much data as it can, but setting
+	// this to true allows the node to attempt a repair if the peers bootstrapper is configured
+	// after the commitlog bootstrapper.
+	ReturnUnfulfilledForCorruptCommitlogFiles bool `yaml:"returnUnfulfilledForCorruptCommitlogFiles"`
 }
 
 // New creates a bootstrap process based on the bootstrap configuration.
 func (bsc BootstrapConfiguration) New(
 	opts storage.Options,
+	topoMapProvider topology.MapProvider,
+	origin topology.Host,
 	adminClient client.AdminClient,
 ) (bootstrap.ProcessProvider, error) {
 	if err := ValidateBootstrappersOrder(bsc.Bootstrappers); err != nil {
@@ -137,7 +135,8 @@ func (bsc BootstrapConfiguration) New(
 		case commitlog.CommitLogBootstrapperName:
 			cOpts := commitlog.NewOptions().
 				SetResultOptions(rsOpts).
-				SetCommitLogOptions(opts.CommitLogOptions())
+				SetCommitLogOptions(opts.CommitLogOptions()).
+				SetRuntimeOptionsManager(opts.RuntimeOptionsManager())
 
 			inspection, err := fs.InspectFilesystem(fsOpts)
 			if err != nil {
@@ -153,27 +152,27 @@ func (bsc BootstrapConfiguration) New(
 				SetAdminClient(adminClient).
 				SetPersistManager(opts.PersistManager()).
 				SetDatabaseBlockRetrieverManager(opts.DatabaseBlockRetrieverManager()).
-				SetFetchBlocksMetadataEndpointVersion(bsc.peersFetchBlocksMetadataEndpointVersion()).
 				SetRuntimeOptionsManager(opts.RuntimeOptionsManager())
 			bs, err = peers.NewPeersBootstrapperProvider(pOpts, bs)
 			if err != nil {
 				return nil, err
 			}
 		case uninitialized.UninitializedTopologyBootstrapperName:
-			uopts := uninitialized.NewOptions().
+			uOpts := uninitialized.NewOptions().
 				SetResultOptions(rsOpts).
 				SetInstrumentOptions(opts.InstrumentOptions())
-			bs = uninitialized.NewuninitializedTopologyBootstrapperProvider(uopts, bs)
+			bs = uninitialized.NewuninitializedTopologyBootstrapperProvider(uOpts, bs)
 		default:
 			return nil, fmt.Errorf("unknown bootstrapper: %s", bsc.Bootstrappers[i])
 		}
 	}
 
-	providerOpts := bootstrap.NewProcessOptions()
+	providerOpts := bootstrap.NewProcessOptions().
+		SetTopologyMapProvider(topoMapProvider).
+		SetOrigin(origin)
 	if bsc.CacheSeriesMetadata != nil {
 		providerOpts = providerOpts.SetCacheSeriesMetadata(*bsc.CacheSeriesMetadata)
 	}
-	providerOpts = providerOpts.SetAdminClient(adminClient)
 	return bootstrap.NewProcessProvider(bs, providerOpts, rsOpts)
 }
 

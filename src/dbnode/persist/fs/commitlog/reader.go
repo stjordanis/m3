@@ -32,17 +32,20 @@ import (
 
 	"github.com/m3db/m3/src/dbnode/persist/fs/msgpack"
 	"github.com/m3db/m3/src/dbnode/persist/schema"
-	"github.com/m3db/m3/src/dbnode/serialize"
 	"github.com/m3db/m3/src/dbnode/ts"
+	"github.com/m3db/m3/src/x/serialize"
 	"github.com/m3db/m3x/checked"
 	"github.com/m3db/m3x/ident"
 	"github.com/m3db/m3x/pool"
 	xtime "github.com/m3db/m3x/time"
 )
 
-const defaultDecodeEntryBufSize = 1024
-const decoderInBufChanSize = 1000
-const decoderOutBufChanSize = 1000
+var (
+	// var instead of const so we can modify them in tests.
+	defaultDecodeEntryBufSize = 1024
+	decoderInBufChanSize      = 1000
+	decoderOutBufChanSize     = 1000
+)
 
 var (
 	emptyLogInfo schema.LogInfo
@@ -60,7 +63,7 @@ func ReadAllSeriesPredicate() SeriesFilterPredicate {
 }
 
 type seriesMetadata struct {
-	Series
+	ts.Series
 	passedPredicate bool
 }
 
@@ -69,14 +72,14 @@ type commitLogReader interface {
 	Open(filePath string) (time.Time, time.Duration, int64, error)
 
 	// Read returns the next id and data pair or error, will return io.EOF at end of volume
-	Read() (Series, ts.Datapoint, xtime.Unit, ts.Annotation, error)
+	Read() (ts.Series, ts.Datapoint, xtime.Unit, ts.Annotation, error)
 
 	// Close the reader
 	Close() error
 }
 
 type readResponse struct {
-	series     Series
+	series     ts.Series
 	datapoint  ts.Datapoint
 	unit       xtime.Unit
 	annotation ts.Annotation
@@ -188,7 +191,7 @@ func (r *reader) Open(filePath string) (time.Time, time.Duration, int64, error) 
 // Then the caller is guaranteed to receive A1 before A2 and A2 before A3, and they are guaranteed
 // to see B1 before B2, but they may see B1 before A1 and D2 before B3.
 func (r *reader) Read() (
-	series Series,
+	series ts.Series,
 	datapoint ts.Datapoint,
 	unit xtime.Unit,
 	annotation ts.Annotation,
@@ -197,12 +200,12 @@ func (r *reader) Read() (
 	if r.nextIndex == 0 {
 		err := r.startBackgroundWorkers()
 		if err != nil {
-			return Series{}, ts.Datapoint{}, xtime.Unit(0), ts.Annotation(nil), err
+			return ts.Series{}, ts.Datapoint{}, xtime.Unit(0), ts.Annotation(nil), err
 		}
 	}
 	rr, ok := <-r.outChan
 	if !ok {
-		return Series{}, ts.Datapoint{}, xtime.Unit(0), ts.Annotation(nil), io.EOF
+		return ts.Series{}, ts.Datapoint{}, xtime.Unit(0), ts.Annotation(nil), io.EOF
 	}
 	r.nextIndex++
 	return rr.series, rr.datapoint, rr.unit, rr.annotation, rr.resultErr
@@ -250,7 +253,7 @@ func (r *reader) readLoop() {
 				}
 
 				r.decoderQueues[0] <- decoderArg{
-					bytes: data,
+					bytes: nil,
 					err:   err,
 				}
 				continue
@@ -383,7 +386,9 @@ func (r *reader) decoderLoop(inBuf <-chan decoderArg, outBuf chan<- readResponse
 }
 
 func (r *reader) handleDecoderLoopIterationEnd(arg decoderArg, outBuf chan<- readResponse, response readResponse, err error) {
-	arg.bufPool <- arg.bytes
+	if arg.bytes != nil {
+		arg.bufPool <- arg.bytes
+	}
 	if outBuf != nil {
 		response.resultErr = err
 		outBuf <- response
@@ -439,7 +444,7 @@ func (r *reader) decodeAndHandleMetadata(
 		}
 	}
 
-	metadata := Series{
+	metadata := ts.Series{
 		UniqueIndex: entry.Index,
 		ID:          ident.BinaryID(id),
 		Namespace:   ident.BinaryID(namespace),

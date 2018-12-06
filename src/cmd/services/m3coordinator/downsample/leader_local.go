@@ -21,11 +21,12 @@
 package downsample
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
-	"github.com/m3db/m3cluster/services"
-	"github.com/m3db/m3cluster/services/leader/campaign"
+	"github.com/m3db/m3/src/cluster/services"
+	"github.com/m3db/m3/src/cluster/services/leader/campaign"
 )
 
 // localLeaderService provides a mocked out local leader service so that
@@ -97,6 +98,10 @@ func (l *localLeaderService) Leader(electionID string) (string, error) {
 		return "", fmt.Errorf("no such campaign: %s", electionID)
 	}
 	return leader, nil
+}
+
+func (l *localLeaderService) Observe(electionID string) (<-chan string, error) {
+	return nil, errors.New("unimplemented")
 }
 
 func (l *localLeaderService) Close() error {

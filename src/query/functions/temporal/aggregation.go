@@ -23,30 +23,32 @@ package temporal
 import (
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/m3db/m3/src/query/executor/transform"
+	"github.com/m3db/m3/src/query/ts"
 )
 
 const (
-	// AvgType calculates the average of all values in the specified interval
+	// AvgType calculates the average of all values in the specified interval.
 	AvgType = "avg_over_time"
 
-	// CountType calculates count of all values in the specified interval
+	// CountType calculates count of all values in the specified interval.
 	CountType = "count_over_time"
 
-	// MinType calculates the minimum of all values in the specified interval
+	// MinType calculates the minimum of all values in the specified interval.
 	MinType = "min_over_time"
 
-	// MaxType calculates the maximum of all values in the specified interval
+	// MaxType calculates the maximum of all values in the specified interval.
 	MaxType = "max_over_time"
 
-	// SumType calculates the sum of all values in the specified interval
+	// SumType calculates the sum of all values in the specified interval.
 	SumType = "sum_over_time"
 
-	// StdDevType calculates the standard deviation of all values in the specified interval
+	// StdDevType calculates the standard deviation of all values in the specified interval.
 	StdDevType = "stddev_over_time"
 
-	// StdVarType calculates the standard variance of all values in the specified interval
+	// StdVarType calculates the standard variance of all values in the specified interval.
 	StdVarType = "stdvar_over_time"
 )
 
@@ -64,21 +66,29 @@ var (
 	}
 )
 
-// NewAggOp creates a new base temporal transform with a specified node
+type aggProcessor struct {
+	aggFunc aggFunc
+}
+
+func (a aggProcessor) Init(op baseOp, controller *transform.Controller, opts transform.Options) Processor {
+	return &aggNode{
+		controller: controller,
+		op:         op,
+		aggFunc:    a.aggFunc,
+	}
+}
+
+// NewAggOp creates a new base temporal transform with a specified node.
 func NewAggOp(args []interface{}, optype string) (transform.Params, error) {
 	if aggregationFunc, ok := aggFuncs[optype]; ok {
-		return newBaseOp(args, optype, newAggNode, aggregationFunc)
+		a := aggProcessor{
+			aggFunc: aggregationFunc,
+		}
+
+		return newBaseOp(args, optype, a)
 	}
 
 	return nil, fmt.Errorf("unknown aggregation type: %s", optype)
-}
-
-func newAggNode(op baseOp, controller *transform.Controller, _ transform.Options) Processor {
-	return &aggNode{
-		op:         op,
-		controller: controller,
-		aggFunc:    op.aggFunc,
-	}
 }
 
 type aggNode struct {
@@ -87,8 +97,8 @@ type aggNode struct {
 	aggFunc    func([]float64) float64
 }
 
-func (a *aggNode) Process(values []float64) float64 {
-	return a.aggFunc(values)
+func (a *aggNode) Process(datapoints ts.Datapoints, _ time.Time) float64 {
+	return a.aggFunc(datapoints.Values())
 }
 
 func avgOverTime(values []float64) float64 {
