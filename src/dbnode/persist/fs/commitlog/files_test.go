@@ -47,9 +47,8 @@ func TestFiles(t *testing.T) {
 		opts.FilesystemOptions().
 			SetFilePathPrefix(dir),
 	)
-	files, corruptFiles, err := Files(opts)
+	files, _, err := Files(opts)
 	require.NoError(t, err)
-	require.True(t, len(corruptFiles) == 0)
 	require.True(t, len(files) >= minNumBlocks)
 
 	// Make sure its sorted.

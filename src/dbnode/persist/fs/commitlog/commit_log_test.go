@@ -207,7 +207,7 @@ func newTestCommitLog(t *testing.T, opts Options) *commitLog {
 	fsopts := opts.FilesystemOptions()
 	files, err := fs.SortedCommitLogFiles(fs.CommitLogsDirPath(fsopts.FilePathPrefix()))
 	require.NoError(t, err)
-	require.True(t, len(files) == 1)
+	require.True(t, len(files) == 2)
 
 	return commitLog
 }
@@ -302,9 +302,8 @@ func assertCommitLogWritesByIterating(t *testing.T, l *commitLog, writes []testW
 		FileFilterPredicate:   ReadAllPredicate(),
 		SeriesFilterPredicate: ReadAllSeriesPredicate(),
 	}
-	iter, corruptFiles, err := NewIterator(iterOpts)
+	iter, _, err := NewIterator(iterOpts)
 	require.NoError(t, err)
-	require.Equal(t, 0, len(corruptFiles))
 	defer iter.Close()
 
 	// Convert the writes to be in-order, but keyed by series ID because the
@@ -385,7 +384,7 @@ func TestReadCommitLogMissingMetadata(t *testing.T) {
 	// Replace bitset in writer with one that configurably returns true or false
 	// depending on the series
 	commitLog := newTestCommitLog(t, opts)
-	writer := commitLog.writerState.writer.(*writer)
+	writer := commitLog.writerState.primaryWriter.(*writer)
 
 	bitSet := bitset.NewBitSet(0)
 
@@ -470,7 +469,7 @@ func TestCommitLogReaderIsNotReusable(t *testing.T) {
 	fsopts := opts.FilesystemOptions()
 	files, err := fs.SortedCommitLogFiles(fs.CommitLogsDirPath(fsopts.FilePathPrefix()))
 	require.NoError(t, err)
-	require.Equal(t, 1, len(files))
+	require.Equal(t, 2, len(files))
 
 	// Assert commitlog cannot be opened more than once
 	reader := newCommitLogReader(opts, ReadAllSeriesPredicate())
@@ -520,7 +519,7 @@ func TestCommitLogIteratorUsesPredicateFilter(t *testing.T) {
 	fsopts := opts.FilesystemOptions()
 	files, err := fs.SortedCommitLogFiles(fs.CommitLogsDirPath(fsopts.FilePathPrefix()))
 	require.NoError(t, err)
-	require.Equal(t, 4, len(files))
+	require.Equal(t, 8, len(files))
 
 	// This predicate should eliminate the first commitlog file
 	commitLogPredicate := func(f persist.CommitlogFile) bool {
@@ -534,12 +533,11 @@ func TestCommitLogIteratorUsesPredicateFilter(t *testing.T) {
 		FileFilterPredicate:   commitLogPredicate,
 		SeriesFilterPredicate: ReadAllSeriesPredicate(),
 	}
-	iter, corruptFiles, err := NewIterator(iterOpts)
+	iter, _, err := NewIterator(iterOpts)
 	require.NoError(t, err)
-	require.Equal(t, 0, len(corruptFiles))
 
 	iterStruct := iter.(*iterator)
-	require.Equal(t, 3, len(iterStruct.files))
+	require.Equal(t, 6, len(iterStruct.files))
 }
 
 func TestCommitLogWriteBehind(t *testing.T) {
@@ -688,7 +686,7 @@ func TestCommitLogFailOnOpenError(t *testing.T) {
 
 	var opens int64
 	writer.openFn = func() (persist.CommitlogFile, error) {
-		if atomic.AddInt64(&opens, 1) >= 2 {
+		if atomic.AddInt64(&opens, 1) >= 4 {
 			return persist.CommitlogFile{}, fmt.Errorf("an error")
 		}
 		return persist.CommitlogFile{}, nil
@@ -774,11 +772,11 @@ func TestCommitLogFailOnFlushError(t *testing.T) {
 	// Check stats
 	errors, ok := snapshotCounterValue(scope, "commitlog.writes.errors")
 	require.True(t, ok)
-	require.Equal(t, int64(1), errors.Value())
+	require.Equal(t, int64(2), errors.Value())
 
 	flushErrors, ok := snapshotCounterValue(scope, "commitlog.writes.flush-errors")
 	require.True(t, ok)
-	require.Equal(t, int64(1), flushErrors.Value())
+	require.Equal(t, int64(2), flushErrors.Value())
 }
 
 func TestCommitLogActiveLogs(t *testing.T) {
@@ -802,7 +800,7 @@ func TestCommitLogActiveLogs(t *testing.T) {
 
 	logs, err := commitLog.ActiveLogs()
 	require.NoError(t, err)
-	require.Equal(t, 1, len(logs))
+	require.Equal(t, 2, len(logs))
 
 	// Close the commit log and consequently flush
 	require.NoError(t, commitLog.Close())
@@ -832,7 +830,8 @@ func TestCommitLogRotateLogs(t *testing.T) {
 		{testSeries(2, "foo.qux", testTags3, 291), start.Add(2 * time.Second), 789.123, xtime.Millisecond, nil, nil},
 	}
 
-	for i, write := range writes {
+	i := 2
+	for _, write := range writes {
 		// Set clock to align with the write.
 		clock.Add(write.t.Sub(clock.Now()))
 
@@ -841,18 +840,19 @@ func TestCommitLogRotateLogs(t *testing.T) {
 
 		file, err := commitLog.RotateLogs()
 		require.NoError(t, err)
-		require.Equal(t, file.Index, int64(i+1))
+		require.Equal(t, file.Index, int64(i))
 		require.Contains(t, file.FilePath, "commitlog-0")
 
 		// Flush until finished, this is required as timed flusher not active when clock is mocked
 		flushUntilDone(commitLog, wg)
+		i += 2
 	}
 
 	// Ensure files present for each call to RotateLogs().
 	fsopts := opts.FilesystemOptions()
 	files, err := fs.SortedCommitLogFiles(fs.CommitLogsDirPath(fsopts.FilePathPrefix()))
 	require.NoError(t, err)
-	require.Equal(t, len(files), len(writes)+1) // +1 to account for the initial file
+	require.Equal(t, len(writes)*2+2, len(files)) // +1 to account for the initial file
 
 	// Close and consequently flush.
 	require.NoError(t, commitLog.Close())
