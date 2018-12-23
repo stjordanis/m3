@@ -520,10 +520,15 @@ func (l *commitLog) write() {
 		l.metrics.success.Inc(numWritesSuccess)
 	}
 
-	writer := l.writerState.primaryWriter
+	// Don't care about errors closing the secondary writer because it
+	// doesn't have any data thats not in the primary.
+	l.writerState.secondaryWriter.Close()
+	l.writerState.secondaryWriter = nil
+
+	primaryWriter := l.writerState.primaryWriter
 	l.writerState.primaryWriter = nil
 
-	l.closeErr <- writer.Close()
+	l.closeErr <- primaryWriter.Close()
 }
 
 func (l *commitLog) onFlush(err error) {
