@@ -37,6 +37,10 @@ import (
 	"github.com/uber-go/tally"
 )
 
+const (
+	sampleSecondaryWriterEvery = 1000
+)
+
 var (
 	// ErrCommitLogQueueFull is raised when trying to write to the commit log
 	// when the queue is full
@@ -407,6 +411,8 @@ func (l *commitLog) write() {
 	var singleBatch = make([]ts.BatchWrite, 1)
 	var batch []ts.BatchWrite
 
+	var sampleSecondaryIndex = 0
+
 	for write := range l.writes {
 		if write.eventType == flushEventType {
 			l.writerState.primaryWriter.Flush(false)
@@ -492,6 +498,16 @@ func (l *commitLog) write() {
 				l.handleWriteErr(err)
 				continue
 			}
+
+			if sampleSecondaryIndex%sampleSecondaryWriterEvery == 0 {
+				err := l.writerState.primaryWriter.WriteIfSeriesNotExist(write.Series,
+					write.Datapoint, write.Unit, write.Annotation)
+				if err != nil {
+					// TODO: Emit a metric
+				}
+			}
+
+			sampleSecondaryIndex++
 			numWritesSuccess++
 		}
 
