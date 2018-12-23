@@ -545,43 +545,46 @@ func (l *commitLog) onFlush(err error) {
 
 // writerState lock must be held for the duration of this function call.
 func (l *commitLog) openWriter() (persist.CommitlogFiles, error) {
-	if l.writerState.primaryWriter != nil {
-		if err := l.writerState.primaryWriter.Close(); err != nil {
-			l.metrics.closeErrors.Inc(1)
-			l.log.Errorf("failed to close commit log: %v", err)
-
-			// If we failed to close then create a new commit log writer
-			l.writerState.primaryWriter = nil
-		}
-	}
-
-	if l.writerState.secondaryWriter != nil {
-		if err := l.writerState.secondaryWriter.Close(); err != nil {
-			l.metrics.closeErrors.Inc(1)
-			l.log.Errorf("failed to close commit log: %v", err)
-
-			// If we failed to close then create a new commit log writer
-			l.writerState.secondaryWriter = nil
-		}
-	}
-
-	if l.writerState.primaryWriter == nil {
+	if l.writerState.primaryWriter == nil || l.writerState.secondaryWriter == nil {
 		l.writerState.primaryWriter = l.newCommitLogWriterFn(l.onFlush, l.opts)
+		l.writerState.secondaryWriter = l.newCommitLogWriterFn(l.onFlush, l.opts)
+
+		primaryFile, err := l.writerState.primaryWriter.Open()
+		if err != nil {
+			return nil, err
+		}
+
+		secondaryFile, err := l.writerState.secondaryWriter.Open()
+		if err != nil {
+			return nil, err
+		}
+
+		l.writerState.activeFiles = persist.CommitlogFiles{primaryFile, secondaryFile}
+		return l.writerState.activeFiles, nil
 	}
-	if l.writerState.secondaryWriter == nil {
+
+	// TODO: add sanity check about length of activeFiles values not being nil and the primary and secondary
+	// writers not being nil.
+
+	// Swap them so that the secondary becomes primary and vice versa.
+	l.writerState.primaryWriter = l.writerState.secondaryWriter
+	l.writerState.secondaryWriter = l.writerState.primaryWriter
+
+	// Close and re-open the secondary one to reset it.
+	if err := l.writerState.secondaryWriter.Close(); err != nil {
+		l.metrics.closeErrors.Inc(1)
+		l.log.Errorf("failed to close commit log: %v", err)
+
+		// If we failed to close then create a new commit log writer.
 		l.writerState.secondaryWriter = l.newCommitLogWriterFn(l.onFlush, l.opts)
 	}
 
-	file1, err := l.writerState.primaryWriter.Open()
-	if err != nil {
-		return nil, err
-	}
-	file2, err := l.writerState.secondaryWriter.Open()
+	newSecondaryFile, err := l.writerState.secondaryWriter.Open()
 	if err != nil {
 		return nil, err
 	}
 
-	files := persist.CommitlogFiles{file1, file2}
+	files := persist.CommitlogFiles{l.writerState.activeFiles[1], newSecondaryFile}
 	l.writerState.activeFiles = files
 
 	return files, nil

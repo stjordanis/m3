@@ -66,11 +66,20 @@ var (
 )
 
 type commitLogWriter interface {
-	// Open opens the commit log for writing data
+	// Open opens the commit log for writing data.
 	Open() (persist.CommitlogFile, error)
 
-	// Write will write an entry in the commit log for a given series
+	// Write will write an entry in the commit log for a given series.
 	Write(
+		series ts.Series,
+		datapoint ts.Datapoint,
+		unit xtime.Unit,
+		annotation ts.Annotation,
+	) error
+
+	// WriteIfSeriesNotExist will write an entry in the commit log for a given
+	// series, if the series metadata has never been seen before.
+	WriteIfSeriesNotExist(
 		series ts.Series,
 		datapoint ts.Datapoint,
 		unit xtime.Unit,
@@ -189,6 +198,20 @@ func (w *writer) Open() (persist.CommitlogFile, error) {
 
 func (w *writer) isOpen() bool {
 	return w.chunkWriter.isOpen()
+}
+
+func (w *writer) WriteIfSeriesNotExist(
+	series ts.Series,
+	datapoint ts.Datapoint,
+	unit xtime.Unit,
+	annotation ts.Annotation,
+) error {
+	seen := w.seen.Test(uint(series.UniqueIndex))
+	if seen {
+		return nil
+	}
+
+	return w.Write(series, datapoint, unit, annotation)
 }
 
 func (w *writer) Write(

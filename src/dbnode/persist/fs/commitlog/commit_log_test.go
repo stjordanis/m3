@@ -153,10 +153,11 @@ func snapshotCounterValue(
 }
 
 type mockCommitLogWriter struct {
-	openFn  func() (persist.CommitlogFile, error)
-	writeFn func(ts.Series, ts.Datapoint, xtime.Unit, ts.Annotation) error
-	flushFn func(sync bool) error
-	closeFn func() error
+	openFn                  func() (persist.CommitlogFile, error)
+	writeFn                 func(ts.Series, ts.Datapoint, xtime.Unit, ts.Annotation) error
+	writeIfSeriesNotExistFn func(ts.Series, ts.Datapoint, xtime.Unit, ts.Annotation) error
+	flushFn                 func(sync bool) error
+	closeFn                 func() error
 }
 
 func newMockCommitLogWriter() *mockCommitLogWriter {
@@ -165,6 +166,9 @@ func newMockCommitLogWriter() *mockCommitLogWriter {
 			return persist.CommitlogFile{}, nil
 		},
 		writeFn: func(ts.Series, ts.Datapoint, xtime.Unit, ts.Annotation) error {
+			return nil
+		},
+		writeIfSeriesNotExistFn: func(ts.Series, ts.Datapoint, xtime.Unit, ts.Annotation) error {
 			return nil
 		},
 		flushFn: func(sync bool) error {
@@ -181,6 +185,15 @@ func (w *mockCommitLogWriter) Open() (persist.CommitlogFile, error) {
 }
 
 func (w *mockCommitLogWriter) Write(
+	series ts.Series,
+	datapoint ts.Datapoint,
+	unit xtime.Unit,
+	annotation ts.Annotation,
+) error {
+	return w.writeFn(series, datapoint, unit, annotation)
+}
+
+func (w *mockCommitLogWriter) WriteIfSeriesNotExist(
 	series ts.Series,
 	datapoint ts.Datapoint,
 	unit xtime.Unit,
@@ -519,7 +532,7 @@ func TestCommitLogIteratorUsesPredicateFilter(t *testing.T) {
 	fsopts := opts.FilesystemOptions()
 	files, err := fs.SortedCommitLogFiles(fs.CommitLogsDirPath(fsopts.FilePathPrefix()))
 	require.NoError(t, err)
-	require.Equal(t, 8, len(files))
+	require.Equal(t, 5, len(files))
 
 	// This predicate should eliminate the first commitlog file
 	commitLogPredicate := func(f persist.CommitlogFile) bool {
@@ -537,7 +550,7 @@ func TestCommitLogIteratorUsesPredicateFilter(t *testing.T) {
 	require.NoError(t, err)
 
 	iterStruct := iter.(*iterator)
-	require.Equal(t, 6, len(iterStruct.files))
+	require.Equal(t, 4, len(iterStruct.files))
 }
 
 func TestCommitLogWriteBehind(t *testing.T) {
@@ -686,7 +699,7 @@ func TestCommitLogFailOnOpenError(t *testing.T) {
 
 	var opens int64
 	writer.openFn = func() (persist.CommitlogFile, error) {
-		if atomic.AddInt64(&opens, 1) >= 4 {
+		if atomic.AddInt64(&opens, 1) >= 3 {
 			return persist.CommitlogFile{}, fmt.Errorf("an error")
 		}
 		return persist.CommitlogFile{}, nil
@@ -830,7 +843,7 @@ func TestCommitLogRotateLogs(t *testing.T) {
 		{testSeries(2, "foo.qux", testTags3, 291), start.Add(2 * time.Second), 789.123, xtime.Millisecond, nil, nil},
 	}
 
-	i := 2
+	i := 1
 	for _, write := range writes {
 		// Set clock to align with the write.
 		clock.Add(write.t.Sub(clock.Now()))
@@ -840,19 +853,20 @@ func TestCommitLogRotateLogs(t *testing.T) {
 
 		file, err := commitLog.RotateLogs()
 		require.NoError(t, err)
-		require.Equal(t, file.Index, int64(i))
+		require.Equal(t, int64(i), file.Index)
 		require.Contains(t, file.FilePath, "commitlog-0")
 
 		// Flush until finished, this is required as timed flusher not active when clock is mocked
 		flushUntilDone(commitLog, wg)
-		i += 2
+		i++
 	}
 
 	// Ensure files present for each call to RotateLogs().
 	fsopts := opts.FilesystemOptions()
 	files, err := fs.SortedCommitLogFiles(fs.CommitLogsDirPath(fsopts.FilePathPrefix()))
 	require.NoError(t, err)
-	require.Equal(t, len(writes)*2+2, len(files)) // +1 to account for the initial file
+	// +2 to account for the initial file + the secondary file.
+	require.Equal(t, len(writes)+2, len(files))
 
 	// Close and consequently flush.
 	require.NoError(t, commitLog.Close())
