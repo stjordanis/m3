@@ -336,6 +336,15 @@ func assertCommitLogWritesByIterating(t *testing.T, l *commitLog, writes []testW
 		series, datapoint, unit, annotation := iter.Current()
 
 		seriesWrites := writesBySeries[series.ID.String()]
+		if seriesWrites.readPosition >= len(seriesWrites.writes) {
+			// Can happen because the primary/secondary commitlog file implementation
+			// means that some commitlog writes will be duplicated. This is fine as
+			// M3DB will handle duplicate values properly by merging, so we can just
+			// skip over these values as we've already verified that writes we expect
+			// to be present exist.
+			continue
+		}
+
 		write := seriesWrites.writes[seriesWrites.readPosition]
 
 		write.assert(t, series, datapoint, unit, annotation)
