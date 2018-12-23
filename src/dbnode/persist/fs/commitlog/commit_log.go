@@ -500,7 +500,7 @@ func (l *commitLog) write() {
 			}
 
 			if sampleSecondaryIndex%sampleSecondaryWriterEvery == 0 {
-				err := l.writerState.primaryWriter.WriteIfSeriesNotExist(write.Series,
+				err := l.writerState.secondaryWriter.WriteIfSeriesNotExist(write.Series,
 					write.Datapoint, write.Unit, write.Annotation)
 				if err != nil {
 					// TODO: Emit a metric
