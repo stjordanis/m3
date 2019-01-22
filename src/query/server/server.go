@@ -62,9 +62,13 @@ import (
 	"github.com/m3db/m3x/pool"
 	xsync "github.com/m3db/m3x/sync"
 	xtime "github.com/m3db/m3x/time"
+	"github.com/uber/jaeger-client-go"
 
 	"github.com/pkg/errors"
 	"github.com/uber-go/tally"
+	jaegercfg "github.com/uber/jaeger-client-go/config"
+	jaegerzap "github.com/uber/jaeger-client-go/log/zap"
+	jaegertally "github.com/uber/jaeger-lib/metrics/tally"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 )
@@ -128,6 +132,19 @@ func Run(runOpts RunOptions) {
 	instrumentOptions := instrument.NewOptions().
 		SetMetricsScope(scope).
 		SetZapLogger(logger)
+
+	jaegerLog := jaegerzap.NewLogger(logger)
+	jaegerCloser, err := cfg.Tracing.InitGlobalTracer("m3query",
+		// nix this
+		jaegercfg.Reporter(jaeger.NewLoggingReporter(jaegerLog)),
+
+		jaegercfg.Logger(jaegerLog),
+		jaegercfg.Metrics(jaegertally.Wrap(scope)))
+
+	if err != nil {
+		logger.Fatal("could not initialize Jaeger")
+	}
+	defer jaegerCloser.Close()
 
 	// Close metrics scope
 	defer func() {
