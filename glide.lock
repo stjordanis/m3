@@ -1,5 +1,5 @@
-hash: 3b9f18246edf191b3b76191c4f5b17dfaab32830c8c6fbac9c8f1699bad13b3f
-updated: 2019-01-20T14:42:37.326427-05:00
+hash: 66069158b5723218f4bccaee4ebc9473b6063ef68ee569a7ddf275c307706741
+updated: 2019-01-28T11:29:31.532958218-05:00
 imports:
 - name: github.com/apache/thrift
   version: c2fb1c4e8c931d22617bebb0bf388cb4d5e6fcff
@@ -15,6 +15,8 @@ imports:
   version: 48099fad606eafc26e3a569fad19ff510fff4df6
 - name: github.com/cockroachdb/cmux
   version: 112f0506e7743d64a6eb8fedbcff13d9979bbf92
+- name: github.com/codahale/hdrhistogram
+  version: 3a0bb77429bd3a61596f5e8a3172445844342120
 - name: github.com/coreos/bbolt
   version: 32c383e75ce054674c53b5a07e55de85332aee14
 - name: github.com/coreos/etcd
@@ -176,10 +178,8 @@ imports:
   - cmp/internal/value
 - name: github.com/google/uuid
   version: 9b3b1e0f5f99ae461456d768e7d301a7acdaa2d8
-- name: github.com/gorilla/context
-  version: 08b5f424b9271eedf6f9f0ce86cb9396ed337a42
 - name: github.com/gorilla/mux
-  version: e3702bed27f0d39777b0b37b664b6280e8ef8fbf
+  version: a7962380ca08b5a188038c69871b8d3fbdf31e89
 - name: github.com/grpc-ecosystem/go-grpc-prometheus
   version: 6b7015e65d366bf3f19b2b2a000a831940f0f7e0
 - name: github.com/grpc-ecosystem/grpc-gateway
@@ -217,7 +217,7 @@ imports:
 - name: github.com/m3db/bloom
   version: 47fe1193cdb900de7193d1f3d26ea9b2cbf6fb31
 - name: github.com/m3db/m3x
-  version: e98ec326dd7b4d4bc97390c709dacf73d49a0bfc
+  version: b66c9c466c4726e3c9b47b1f837abbbe0f14be81
   vcs: git
   subpackages:
   - checked
@@ -228,6 +228,7 @@ imports:
   - config/listenaddress
   - context
   - errors
+  - hash/jump
   - ident
   - ident/testutil
   - instrument
@@ -244,6 +245,7 @@ imports:
   - tcp
   - test
   - time
+  - unsafe
   - watch
 - name: github.com/m3db/prometheus_client_golang
   version: 8ae269d24972b8695572fa6b2e3718b5ea82d6b4
@@ -284,10 +286,15 @@ imports:
   version: 1d49c987357a327b5b03aa84cbddd582c328615d
 - name: github.com/oklog/ulid
   version: 66bb6560562feca7045b23db1ae85b01260f87c5
+- name: github.com/opentracing-contrib/go-stdlib
+  version: 77df8e8e70b403c6b13c0fffaa4867c9044ff4e9
+  subpackages:
+  - nethttp
 - name: github.com/opentracing/opentracing-go
-  version: 855519783f479520497c6b3445611b05fc42f009
+  version: 1949ddbfd147afd4d964a9f00b24eb291e0e7c38
   subpackages:
   - ext
+  - log
 - name: github.com/pborman/getopt
   version: ec82d864f599c39673eef89f91b93fa5576567a1
 - name: github.com/pborman/uuid
@@ -395,6 +402,31 @@ imports:
   - m3/thriftudp
   - multi
   - prometheus
+- name: github.com/uber/jaeger-client-go
+  version: 1a782e2da844727691fef1757c72eb190c2909f0
+  subpackages:
+  - config
+  - internal/baggage
+  - internal/baggage/remote
+  - internal/spanlog
+  - internal/throttler
+  - internal/throttler/remote
+  - log
+  - log/zap
+  - rpcmetrics
+  - thrift
+  - thrift-gen/agent
+  - thrift-gen/baggage
+  - thrift-gen/jaeger
+  - thrift-gen/sampling
+  - thrift-gen/zipkincore
+  - transport
+  - utils
+- name: github.com/uber/jaeger-lib
+  version: ed3a127ec5fef7ae9ea95b01b542c47fbd999ce5
+  subpackages:
+  - metrics
+  - metrics/tally
 - name: github.com/uber/tchannel-go
   version: 1fcf82ec86967eb43ba0baa9b964f8eb226d242e
   subpackages:
