@@ -62,7 +62,6 @@ import (
 	"github.com/m3db/m3x/pool"
 	xsync "github.com/m3db/m3x/sync"
 	xtime "github.com/m3db/m3x/time"
-	"github.com/uber/jaeger-client-go"
 
 	"github.com/pkg/errors"
 	"github.com/uber-go/tally"
@@ -136,7 +135,7 @@ func Run(runOpts RunOptions) {
 	jaegerLog := jaegerzap.NewLogger(logger)
 	jaegerCloser, err := cfg.Tracing.InitGlobalTracer("m3query",
 		// nix this
-		jaegercfg.Reporter(jaeger.NewLoggingReporter(jaegerLog)),
+		// jaegercfg.Reporter(jaeger.NewCompositeReporter(jaeger.NewLoggingReporter(jaegerLog), jaeger.NewRemoteReporter()),
 
 		jaegercfg.Logger(jaegerLog),
 		jaegercfg.Metrics(jaegertally.Wrap(scope)))

@@ -52,7 +52,7 @@ type Configuration struct {
 	// Metrics configuration.
 	Metrics instrument.MetricsConfiguration `yaml:"metrics"`
 
-	Tracing jaegercfg.Configuration
+	Tracing jaegercfg.Configuration `yaml:"tracing"`
 
 	// Clusters is the DB cluster configurations for read, write and
 	// query endpoints.

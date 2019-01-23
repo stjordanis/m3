@@ -22,6 +22,7 @@ package httpd
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	_ "net/http/pprof" // needed for pprof handler registration
 	"time"
@@ -47,6 +48,8 @@ import (
 	"github.com/m3db/m3/src/query/util/logging"
 	"github.com/m3db/m3/src/x/net/http"
 	"github.com/m3db/m3/src/x/net/http/cors"
+	"github.com/opentracing-contrib/go-stdlib/nethttp"
+	"github.com/opentracing/opentracing-go"
 
 	"github.com/gorilla/mux"
 	"github.com/uber-go/tally"
@@ -96,13 +99,19 @@ func NewHandler(
 ) (*Handler, error) {
 	r := mux.NewRouter()
 
-	// apply middleware. Just CORS for now, but we could add more here as needed.
-	withMiddleware := &cors.Handler{
+	// apply middleware.
+	var withMiddleware http.Handler = &cors.Handler{
 		Handler: r,
 		Info: &cors.Info{
 			"*": true,
 		},
 	}
+
+	// add jaeger tracing to our endpoints
+	withMiddleware = nethttp.Middleware(opentracing.GlobalTracer(), withMiddleware,
+		nethttp.OperationNameFunc(func(r *http.Request) string {
+			return fmt.Sprintf("%s %s", r.Method, r.URL.Path)
+		}))
 
 	h := &Handler{
 		router:        r,
