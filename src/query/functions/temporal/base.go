@@ -97,6 +97,10 @@ type baseNode struct {
 	transformOpts transform.Options
 }
 
+func (c *baseNode) Params() parser.Params {
+	return c.op
+}
+
 // Process processes a block. The processing steps are as follows:
 // 1. Figure out the maximum blocks needed for the temporal function
 // 2. For the current block, figure out whether we have enough previous blocks which can help process it

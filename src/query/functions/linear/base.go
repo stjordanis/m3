@@ -64,6 +64,10 @@ type baseNode struct {
 	processor  Processor
 }
 
+func (c *baseNode) Params() parser.Params {
+	return c.op
+}
+
 // Ensure baseNode implements the types for lazy evaluation
 var _ transform.StepNode = (*baseNode)(nil)
 var _ transform.SeriesNode = (*baseNode)(nil)

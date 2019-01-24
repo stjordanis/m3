@@ -23,6 +23,7 @@ package executor
 import (
 	"github.com/m3db/m3/src/query/block"
 	"github.com/m3db/m3/src/query/executor/transform"
+	"github.com/m3db/m3/src/query/functions/utils"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/parser"
 )
@@ -46,6 +47,10 @@ type SinkNode struct {
 	Values [][]float64
 	Meta   block.Metadata
 	Metas  []block.SeriesMeta
+}
+
+func (s *SinkNode) Params() parser.Params {
+	return utils.StaticParams("sink")
 }
 
 // Process processes and stores the last block output in the sink node

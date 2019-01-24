@@ -83,6 +83,10 @@ type timestampNode struct {
 	controller *transform.Controller
 }
 
+func (n *timestampNode) Params() parser.Params {
+	return n.op
+}
+
 // Process the block
 func (n *timestampNode) Process(queryCtx *models.QueryContext, ID parser.NodeID, b block.Block) error {
 	unconsolidatedBlock, err := b.Unconsolidated()

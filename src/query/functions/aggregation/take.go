@@ -111,6 +111,10 @@ type takeNode struct {
 	controller *transform.Controller
 }
 
+func (n *takeNode) Params() parser.Params {
+	return n.op
+}
+
 // Process the block
 func (n *takeNode) Process(queryCtx *models.QueryContext, ID parser.NodeID, b block.Block) error {
 	stepIter, err := b.StepIter()

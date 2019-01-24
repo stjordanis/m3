@@ -24,12 +24,19 @@ import (
 	"sync"
 
 	"github.com/m3db/m3/src/query/block"
+	"github.com/m3db/m3/src/query/functions/utils"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/parser"
 )
 
 type sinkNode struct {
 	block block.Block
+}
+
+// Params for sinkNode returns an params object for lazy sinks. It doesn't appear in queries (since sink nodes are
+// inserted later).
+func (s *sinkNode) Params() parser.Params {
+	return utils.StaticParams("sink")
 }
 
 func (s *sinkNode) Process(queryCtx *models.QueryContext, ID parser.NodeID, block block.Block) error {
@@ -41,6 +48,10 @@ type lazyNode struct {
 	fNode      OpNode
 	controller *Controller
 	sink       *sinkNode
+}
+
+func (f *lazyNode) Params() parser.Params {
+	return f.fNode.Params()
 }
 
 // NewLazyNode creates a new wrapper around a function fNode to make it support lazy initialization

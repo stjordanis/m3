@@ -88,6 +88,10 @@ type countValuesNode struct {
 	controller *transform.Controller
 }
 
+func (n *countValuesNode) Params() parser.Params {
+	return n.op
+}
+
 // bucketColumn represents a column of times a particular value in a series has
 // been seen. This may expand as more unique values are seen
 type bucketColumn []float64

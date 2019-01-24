@@ -97,6 +97,10 @@ type baseNode struct {
 	controller *transform.Controller
 }
 
+func (n *baseNode) Params() parser.Params {
+	return n.op
+}
+
 // Process the block.
 func (n *baseNode) Process(queryCtx *models.QueryContext, ID parser.NodeID, b block.Block) error {
 	it, err := b.StepIter()

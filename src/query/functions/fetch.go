@@ -30,6 +30,7 @@ import (
 	"github.com/m3db/m3/src/query/storage"
 	"github.com/m3db/m3/src/query/util/logging"
 
+	"github.com/opentracing/opentracing-go"
 	"go.uber.org/zap"
 )
 
@@ -88,6 +89,9 @@ func (o FetchOp) Node(controller *transform.Controller, storage storage.Storage,
 
 // Execute runs the fetch node operation
 func (n *FetchNode) Execute(queryCtx *models.QueryContext) error {
+	sp, _ := opentracing.StartSpanFromContext(queryCtx.Ctx, "fetch")
+	defer sp.Finish()
+
 	timeSpec := n.timespec
 	// No need to adjust start and ends since physical plan already considers the offset, range
 	startTime := timeSpec.Start

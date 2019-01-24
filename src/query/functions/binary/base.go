@@ -115,6 +115,10 @@ type baseNode struct {
 	mu         sync.Mutex
 }
 
+func (n *baseNode) Params() parser.Params {
+	return n.op
+}
+
 type processFunc func(*models.QueryContext, block.Block, block.Block, *transform.Controller) (block.Block, error)
 
 // Process processes a block

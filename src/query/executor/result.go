@@ -24,6 +24,7 @@ import (
 	"sync"
 
 	"github.com/m3db/m3/src/query/block"
+	"github.com/m3db/m3/src/query/functions/utils"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/parser"
 
@@ -51,6 +52,10 @@ type ResultNode struct {
 	mu         sync.Mutex
 	resultChan chan ResultChan
 	aborted    bool
+}
+
+func (r *ResultNode) Params() parser.Params {
+	return utils.StaticParams("result")
 }
 
 // ResultChan has the result from a block

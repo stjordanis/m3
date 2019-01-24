@@ -24,6 +24,7 @@ import (
 	"github.com/m3db/m3/src/query/block"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/parser"
+	"github.com/opentracing/opentracing-go"
 )
 
 // Controller controls the caching and forwarding the request to downstream.
@@ -40,7 +41,16 @@ func (t *Controller) AddTransform(node OpNode) {
 // Process performs processing on the underlying transforms
 func (t *Controller) Process(queryCtx *models.QueryContext, block block.Block) error {
 	for _, ts := range t.transforms {
+
+		// TODO: ts.Process calls its children's .Process before returning (via controller).
+		// This screws up the tracing--it looks like ts isn't done processing, even though it's actually
+		// completely handed off control to the child node.
+		// This could be fixed by moving the spans into each node, and *finishing* the span before handing off
+		// to the next. More elegantly, we could refactor Process to be block in, block out, and outsource passing
+		// blocks between nodes to an external actor (better use of Controller maybe).
+		sp, _ := opentracing.StartSpanFromContext(queryCtx.Ctx, ts.Params().OpType())
 		err := ts.Process(queryCtx, t.ID, block)
+		sp.Finish()
 		if err != nil {
 			return err
 		}
