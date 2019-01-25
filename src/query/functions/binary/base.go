@@ -28,6 +28,7 @@ import (
 	"github.com/m3db/m3/src/query/executor/transform"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/parser"
+	"github.com/opentracing/opentracing-go"
 )
 
 type baseOp struct {
@@ -137,13 +138,21 @@ func (n *baseNode) Process(queryCtx *models.QueryContext, ID parser.NodeID, b bl
 
 	n.cleanup()
 
-	nextBlock, err := n.process(queryCtx, lhs, rhs, n.controller)
+	nextBlock, err := n.processWithTracing(queryCtx, lhs, rhs)
 	if err != nil {
 		return err
 	}
 
 	defer nextBlock.Close()
 	return n.controller.Process(queryCtx, nextBlock)
+}
+
+func (n *baseNode) processWithTracing(queryCtx *models.QueryContext, lhs block.Block, rhs block.Block) (block.Block, error) {
+	sp, ctx := opentracing.StartSpanFromContext(queryCtx.Ctx, n.op.OpType())
+	defer sp.Finish()
+	queryCtx = queryCtx.WithDerivedContext(ctx)
+
+	return n.process(queryCtx, lhs, rhs, n.controller)
 }
 
 // computeOrCache figures out if both lhs and rhs are available, if not then it caches the incoming block

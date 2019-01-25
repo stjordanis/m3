@@ -21,9 +21,11 @@
 package functions
 
 import (
+	"context"
 	"fmt"
 	"time"
 
+	"github.com/m3db/m3/src/query/block"
 	"github.com/m3db/m3/src/query/executor/transform"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/parser"
@@ -87,18 +89,15 @@ func (o FetchOp) Node(controller *transform.Controller, storage storage.Storage,
 	}
 }
 
-// Execute runs the fetch node operation
-func (n *FetchNode) Execute(queryCtx *models.QueryContext) error {
-	sp, _ := opentracing.StartSpanFromContext(queryCtx.Ctx, "fetch")
+func (n *FetchNode) fetch(ctx context.Context, queryCtx *models.QueryContext) (block.Result, error) {
+	sp, _ := opentracing.StartSpanFromContext(ctx, "fetch")
 	defer sp.Finish()
 
 	timeSpec := n.timespec
 	// No need to adjust start and ends since physical plan already considers the offset, range
 	startTime := timeSpec.Start
 	endTime := timeSpec.End
-	ctx := queryCtx.Ctx
-
-	blockResult, err := n.storage.FetchBlocks(ctx, &storage.FetchQuery{
+	return n.storage.FetchBlocks(ctx, &storage.FetchQuery{
 		Start:       startTime,
 		End:         endTime,
 		TagMatchers: n.op.Matchers,
@@ -108,6 +107,11 @@ func (n *FetchNode) Execute(queryCtx *models.QueryContext) error {
 		Enforcer:  queryCtx.Enforcer,
 		Scope:     queryCtx.Scope,
 	})
+}
+
+// Execute runs the fetch node operation
+func (n *FetchNode) Execute(queryCtx *models.QueryContext) error {
+	blockResult, err := n.fetch(queryCtx.Ctx, queryCtx)
 	if err != nil {
 		return err
 	}
