@@ -68,5 +68,4 @@ limits:
     maxFetchedDatapoints: 500000000
 
 tracing:
-  reporter:
-    logSpans: true
+  backend: jaeger

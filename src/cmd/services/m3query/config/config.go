@@ -24,7 +24,6 @@ import (
 	"time"
 
 	etcdclient "github.com/m3db/m3/src/cluster/client/etcd"
-	jaegercfg "github.com/uber/jaeger-client-go/config"
 
 	"github.com/m3db/m3/src/cmd/services/m3coordinator/downsample"
 	"github.com/m3db/m3/src/cmd/services/m3coordinator/ingest"
@@ -52,7 +51,7 @@ type Configuration struct {
 	// Metrics configuration.
 	Metrics instrument.MetricsConfiguration `yaml:"metrics"`
 
-	Tracing jaegercfg.Configuration `yaml:"tracing"`
+	Tracing instrument.TracingConfiguration `yaml:"tracing"`
 
 	// Clusters is the DB cluster configurations for read, write and
 	// query endpoints.

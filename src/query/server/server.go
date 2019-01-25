@@ -63,13 +63,15 @@ import (
 	xsync "github.com/m3db/m3x/sync"
 	xtime "github.com/m3db/m3x/time"
 
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/uber-go/tally"
-	jaegercfg "github.com/uber/jaeger-client-go/config"
-	jaegerzap "github.com/uber/jaeger-client-go/log/zap"
-	jaegertally "github.com/uber/jaeger-lib/metrics/tally"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+)
+
+const (
+	serviceName = "m3query"
 )
 
 var (
@@ -128,22 +130,22 @@ func Run(runOpts RunOptions) {
 	if err != nil {
 		logger.Fatal("could not connect to metrics", zap.Any("error", err))
 	}
+
+	tracer, traceCloser, err := cfg.Tracing.NewTracer(serviceName, scope, logger)
+	if err != nil {
+		logger.Fatal("could not initialize tracing", zap.Error(err))
+	}
+
+	defer traceCloser.Close()
+
+	if _, ok := tracer.(opentracing.NoopTracer); ok {
+		logger.Info("tracing disabled; set `tracing.backend` to enable")
+	}
+
 	instrumentOptions := instrument.NewOptions().
 		SetMetricsScope(scope).
-		SetZapLogger(logger)
-
-	jaegerLog := jaegerzap.NewLogger(logger)
-	jaegerCloser, err := cfg.Tracing.InitGlobalTracer("m3query",
-		// nix this
-		// jaegercfg.Reporter(jaeger.NewCompositeReporter(jaeger.NewLoggingReporter(jaegerLog), jaeger.NewRemoteReporter()),
-
-		jaegercfg.Logger(jaegerLog),
-		jaegercfg.Metrics(jaegertally.Wrap(scope)))
-
-	if err != nil {
-		logger.Fatal("could not initialize Jaeger")
-	}
-	defer jaegerCloser.Close()
+		SetZapLogger(logger).
+		SetTracer(tracer)
 
 	// Close metrics scope
 	defer func() {
