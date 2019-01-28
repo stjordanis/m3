@@ -49,6 +49,7 @@ type SinkNode struct {
 	Metas  []block.SeriesMeta
 }
 
+// Params returns the Params associated with this node.
 func (s *SinkNode) Params() parser.Params {
 	return utils.StaticParams("sink")
 }

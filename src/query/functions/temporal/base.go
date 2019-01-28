@@ -33,8 +33,8 @@ import (
 	"github.com/m3db/m3/src/query/parser"
 	"github.com/m3db/m3/src/query/ts"
 	"github.com/m3db/m3/src/query/util/logging"
-	"github.com/opentracing/opentracing-go"
 
+	"github.com/opentracing/opentracing-go"
 	"go.uber.org/zap"
 )
 

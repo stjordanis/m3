@@ -54,6 +54,7 @@ type ResultNode struct {
 	aborted    bool
 }
 
+// Params returns the params associated with this node.
 func (r *ResultNode) Params() parser.Params {
 	return utils.StaticParams("result")
 }

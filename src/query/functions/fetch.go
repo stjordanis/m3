@@ -111,6 +111,7 @@ func (n *FetchNode) fetch(ctx context.Context, queryCtx *models.QueryContext) (b
 
 // Execute runs the fetch node operation
 func (n *FetchNode) Execute(queryCtx *models.QueryContext) error {
+	ctx := queryCtx.Ctx
 	blockResult, err := n.fetch(queryCtx.Ctx, queryCtx)
 	if err != nil {
 		return err

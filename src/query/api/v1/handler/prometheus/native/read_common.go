@@ -34,6 +34,7 @@ import (
 	"github.com/m3db/m3/src/query/parser/promql"
 	"github.com/m3db/m3/src/query/ts"
 	opentracingutil "github.com/m3db/m3/src/query/util/opentracing"
+
 	opentracinglog "github.com/opentracing/opentracing-go/log"
 )
 

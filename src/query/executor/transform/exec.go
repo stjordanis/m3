@@ -24,15 +24,24 @@ import (
 	"github.com/m3db/m3/src/query/block"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/parser"
+
 	"github.com/opentracing/opentracing-go"
 )
 
-type simpleBlock interface {
+type simpleOpNode interface {
 	OpNode
 	ProcessBlock(queryCtx *models.QueryContext, ID parser.NodeID, b block.Block) (block.Block, error)
 }
 
-func ProcessSimpleBlock(node simpleBlock, controller *Controller, queryCtx *models.QueryContext, ID parser.NodeID, b block.Block) error {
+// ProcessSimpleBlock is a utility for OpNode instances which simply propagate their data after doing their own
+// processing, allowing them to implement a simpler interface.
+// It adds instrumentation to the processing, and handles propagating the block downstream.
+// OpNode's should call this as their implementation of the Process method:
+//
+// func (n MyNode) Process(queryCtx *models.QueryContext, ID parser.NodeID, b block.Block) error {
+//     return transform.ProcessSimpleBlock(n, n.controller, queryCtx, ID, b)
+// }
+func ProcessSimpleBlock(node simpleOpNode, controller *Controller, queryCtx *models.QueryContext, ID parser.NodeID, b block.Block) error {
 	sp, _ := opentracing.StartSpanFromContext(queryCtx.Ctx, node.Params().OpType())
 	nextBlock, err := node.ProcessBlock(queryCtx, ID, b)
 	sp.Finish()

@@ -45,10 +45,12 @@ func SpanFromContextOrRoot(ctx context.Context) (opentracing.Span, context.Conte
 	return sp, ctx
 }
 
+// Time is a log.Field for time.Time values. It translates to RF3339 formatted time strings.
 func Time(key string, t time.Time) log.Field {
 	return log.String(key, t.Format(time.RFC3339))
 }
 
+// Duration is a log.Field for Duration values. It translates to the standard Go duration format (Duration.String()).
 func Duration(key string, t time.Duration) log.Field {
 	return log.String(key, fmt.Sprint(t))
 }

@@ -28,6 +28,7 @@ import (
 	"github.com/m3db/m3/src/query/executor/transform"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/parser"
+
 	"github.com/opentracing/opentracing-go"
 )
 
@@ -150,7 +151,7 @@ func (n *baseNode) Process(queryCtx *models.QueryContext, ID parser.NodeID, b bl
 func (n *baseNode) processWithTracing(queryCtx *models.QueryContext, lhs block.Block, rhs block.Block) (block.Block, error) {
 	sp, ctx := opentracing.StartSpanFromContext(queryCtx.Ctx, n.op.OpType())
 	defer sp.Finish()
-	queryCtx = queryCtx.WithDerivedContext(ctx)
+	queryCtx = queryCtx.WithContext(ctx)
 
 	return n.process(queryCtx, lhs, rhs, n.controller)
 }

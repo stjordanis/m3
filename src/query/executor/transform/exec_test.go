@@ -18,17 +18,16 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-package utils
+package transform
 
-// StaticParams is a simple string Params implementation, useful for when no data other than OpType is needed.
-type StaticParams string
+import "testing"
 
-// String simply returns s.
-func (s StaticParams) String() string {
-	return string(s)
-}
+func TestProcessSimpleBlock(t *testing.T) {
+	t.Run("closes next block", func(t *testing.T) {
 
-// OpType simply returns s for StaticParams.
-func (s StaticParams) OpType() string {
-	return string(s)
+	})
+
+	t.Run("errors on process error", func(t *testing.T) {
+
+	})
 }
