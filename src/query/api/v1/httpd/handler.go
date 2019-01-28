@@ -97,9 +97,9 @@ func NewHandler(
 	r := mux.NewRouter()
 
 	// apply middleware. Just CORS for now, but we could add more here as needed.
-	withMiddleware := &cors.CORSHandler{
+	withMiddleware := &cors.Handler{
 		Handler: r,
-		Info: &cors.CORSInfo{
+		Info: &cors.Info{
 			"*": true,
 		},
 	}
