@@ -769,12 +769,6 @@ type Options interface {
 	// PersistManager returns the persistence manager.
 	PersistManager() persist.Manager
 
-	// SetMinimumSnapshotInterval sets the minimum amount of time that must elapse between snapshots.
-	SetMinimumSnapshotInterval(value time.Duration) Options
-
-	// MinimumSnapshotInterval returns the minimum amount of time that must elapse between snapshots.
-	MinimumSnapshotInterval() time.Duration
-
 	// SetDatabaseBlockRetrieverManager sets the block retriever manager to
 	// use when bootstrapping retrievable blocks instead of blocks
 	// containing data.

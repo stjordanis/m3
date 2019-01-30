@@ -3055,34 +3055,6 @@ func (mr *MockOptionsMockRecorder) PersistManager() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PersistManager", reflect.TypeOf((*MockOptions)(nil).PersistManager))
 }
 
-// SetMinimumSnapshotInterval mocks base method
-func (m *MockOptions) SetMinimumSnapshotInterval(value time.Duration) Options {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "SetMinimumSnapshotInterval", value)
-	ret0, _ := ret[0].(Options)
-	return ret0
-}
-
-// SetMinimumSnapshotInterval indicates an expected call of SetMinimumSnapshotInterval
-func (mr *MockOptionsMockRecorder) SetMinimumSnapshotInterval(value interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetMinimumSnapshotInterval", reflect.TypeOf((*MockOptions)(nil).SetMinimumSnapshotInterval), value)
-}
-
-// MinimumSnapshotInterval mocks base method
-func (m *MockOptions) MinimumSnapshotInterval() time.Duration {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "MinimumSnapshotInterval")
-	ret0, _ := ret[0].(time.Duration)
-	return ret0
-}
-
-// MinimumSnapshotInterval indicates an expected call of MinimumSnapshotInterval
-func (mr *MockOptionsMockRecorder) MinimumSnapshotInterval() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "MinimumSnapshotInterval", reflect.TypeOf((*MockOptions)(nil).MinimumSnapshotInterval))
-}
-
 // SetDatabaseBlockRetrieverManager mocks base method
 func (m *MockOptions) SetDatabaseBlockRetrieverManager(value block.DatabaseBlockRetrieverManager) Options {
 	m.ctrl.T.Helper()

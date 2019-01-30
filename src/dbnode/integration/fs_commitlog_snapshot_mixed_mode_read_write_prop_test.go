@@ -125,10 +125,7 @@ func TestFsCommitLogMixedModeReadWriteProp(t *testing.T) {
 					return false, err
 				}
 				opts := newTestOptions(t).
-					SetNamespaces([]namespace.Metadata{ns1}).
-					// Make sure that we're never waiting for a snapshot that doesn't occur
-					// because we haven't updated the clock.
-					SetMinimumSnapshotInterval(0)
+					SetNamespaces([]namespace.Metadata{ns1})
 
 				// Test setup
 				setup := newTestSetupWithCommitLogAndFilesystemBootstrapper(t, opts)
