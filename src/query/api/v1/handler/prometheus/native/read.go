@@ -32,8 +32,11 @@ import (
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/ts"
 	"github.com/m3db/m3/src/query/util/logging"
+	opentracingutil "github.com/m3db/m3/src/query/util/opentracing"
 	"github.com/m3db/m3/src/x/net/http"
 
+	opentracingext "github.com/opentracing/opentracing-go/ext"
+	opentracinglog "github.com/opentracing/opentracing-go/log"
 	"github.com/uber-go/tally"
 	"go.uber.org/zap"
 )
@@ -94,10 +97,24 @@ func NewPromReadHandler(
 	}
 }
 
+type errorWithID struct {
+	xhttp.ErrorResponse
+	RqID string `json:"rqID"`
+}
+
 func (h *PromReadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
 	result, params, respErr := h.ServeHTTPWithEngine(w, r, h.engine)
 	if respErr != nil {
-		xhttp.Error(w, respErr.Err, respErr.Code)
+		logging.ReadContextID(ctx)
+		w.WriteHeader(respErr.Code)
+		xhttp.WriteJSONResponse(w, errorWithID{
+			ErrorResponse: xhttp.ErrorResponse{
+				Error: respErr.Err.Error(),
+			},
+			RqID: logging.ReadContextID(ctx),
+		}, logging.WithContext(ctx))
 		return
 	}
 
@@ -114,6 +131,7 @@ func (h *PromReadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // ServeHTTPWithEngine returns query results from the storage
 func (h *PromReadHandler) ServeHTTPWithEngine(w http.ResponseWriter, r *http.Request, engine *executor.Engine) ([]*ts.Series, models.RequestParams, *RespError) {
 	ctx := context.WithValue(r.Context(), handler.HeaderKey, r.Header)
+	sp := opentracingutil.SpanFromContextOrRoot(ctx)
 	logger := logging.WithContext(ctx)
 
 	params, rErr := parseParams(r)
@@ -131,6 +149,8 @@ func (h *PromReadHandler) ServeHTTPWithEngine(w http.ResponseWriter, r *http.Req
 
 	result, err := read(ctx, engine, h.tagOpts, w, params)
 	if err != nil {
+		sp.LogFields(opentracinglog.Error(err))
+		opentracingext.Error.Set(sp, true)
 		logger.Error("unable to fetch data", zap.Error(err))
 		return nil, emptyReqParams, &RespError{Err: err, Code: http.StatusInternalServerError}
 	}

@@ -33,16 +33,14 @@ import (
 // SpanFromContextOrRoot is the same as opentracing.SpanFromContext, but instead of returning nil, it starts a
 // a new root span if ctx doesn't already have an associated span, instead of returning nil. Use this over
 // opentracing.StartSpanFromContext if you need access to the current span, but don't want to start a child span.
-// Note: the span returned by this function won't really be configured; if you want a proper span, start one
-// at the root and pass it in.
-func SpanFromContextOrRoot(ctx context.Context) (opentracing.Span, context.Context) {
+// Note: the span returned by this function won't really be configured, and won't be attached to the context; if you
+// want a proper span, start one at the root and pass it in.
+func SpanFromContextOrRoot(ctx context.Context) opentracing.Span {
 	sp := opentracing.SpanFromContext(ctx)
-	if sp == nil {
-		sp = opentracing.StartSpan("SpanFromContextOrRoot - dummy")
+	if sp != nil {
+		return sp
 	}
-
-	ctx = opentracing.ContextWithSpan(ctx, sp)
-	return sp, ctx
+	return opentracing.StartSpan("SpanFromContextOrRoot - dummy")
 }
 
 // Time is a log.Field for time.Time values. It translates to RF3339 formatted time strings.

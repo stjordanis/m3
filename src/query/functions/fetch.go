@@ -21,7 +21,6 @@
 package functions
 
 import (
-	"context"
 	"fmt"
 	"time"
 
@@ -89,7 +88,8 @@ func (o FetchOp) Node(controller *transform.Controller, storage storage.Storage,
 	}
 }
 
-func (n *FetchNode) fetch(ctx context.Context, queryCtx *models.QueryContext) (block.Result, error) {
+func (n *FetchNode) fetch(queryCtx *models.QueryContext) (block.Result, error) {
+	ctx := queryCtx.Ctx
 	sp, _ := opentracing.StartSpanFromContext(ctx, "fetch")
 	defer sp.Finish()
 
@@ -112,7 +112,7 @@ func (n *FetchNode) fetch(ctx context.Context, queryCtx *models.QueryContext) (b
 // Execute runs the fetch node operation
 func (n *FetchNode) Execute(queryCtx *models.QueryContext) error {
 	ctx := queryCtx.Ctx
-	blockResult, err := n.fetch(queryCtx.Ctx, queryCtx)
+	blockResult, err := n.fetch(queryCtx)
 	if err != nil {
 		return err
 	}
