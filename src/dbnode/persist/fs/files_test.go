@@ -1048,6 +1048,12 @@ func TestSnapshotFileSnapshotTimeAndIDNotSnapshot(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestCommitlogFilePath(t *testing.T) {
+	expected := "/var/lib/m3db/commitlogs/commitlog-0-1.db"
+	actual := CommitlogFilePath("/var/lib/m3db", time.Unix(0, 0), 1)
+	require.Equal(t, expected, actual)
+}
+
 func createTempFile(t *testing.T) *os.File {
 	fd, err := ioutil.TempFile("", "testfile")
 	require.NoError(t, err)

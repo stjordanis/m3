@@ -1330,7 +1330,6 @@ func OpenWritable(filePath string, perm os.FileMode) (*os.File, error) {
 }
 
 // CommitlogFilePath returns the path for a commitlog file.
-// TODO(rartoul): Unit test for this
 func CommitlogFilePath(prefix string, start time.Time, index int) string {
 	var (
 		entry    = fmt.Sprintf("%d%s%d", start.UnixNano(), separator, index)
