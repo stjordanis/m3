@@ -194,7 +194,7 @@ type CommitLogPolicy struct {
 	QueueChannel *CommitLogQueuePolicy `yaml:"queueChannel"`
 
 	// Deprecated. Left in struct to keep old YAMLs parseable.
-	DeprecatedBlockSize time.Duration `yaml:"blockSize"`
+	DeprecatedBlockSize *time.Duration `yaml:"blockSize"`
 }
 
 // CalculationType is a type of configuration parameter.
