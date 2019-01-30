@@ -58,9 +58,9 @@ type flushManager struct {
 	commitlog commitlog.CommitLog
 	opts      Options
 	pm        persist.Manager
-	// isFlushingOrSnapshotting is used to protect the flush manager against
-	// concurrent use, while flushInProgress and snapshotInProgress are more
-	// granular and are used for emitting granular gauges.
+	// state is used to protect the flush manager against concurrent use,
+	// while flushInProgress and snapshotInProgress are more granular and
+	// are used for emitting granular gauges.
 	state           flushManagerState
 	isFlushing      tally.Gauge
 	isSnapshotting  tally.Gauge
@@ -203,12 +203,12 @@ func (m *flushManager) snapshot(
 	}
 
 	m.setState(flushManagerSnapshotInProgress)
-	maxBlocksSnapshottedByNamespace := 0
-	multiErr := xerrors.NewMultiError()
+	var (
+		maxBlocksSnapshottedByNamespace = 0
+		multiErr                        = xerrors.NewMultiError()
+	)
 	for _, ns := range namespaces {
-		var (
-			snapshotBlockStarts = m.namespaceSnapshotTimes(ns, tickStart)
-		)
+		snapshotBlockStarts := m.namespaceSnapshotTimes(ns, tickStart)
 
 		if len(snapshotBlockStarts) > maxBlocksSnapshottedByNamespace {
 			maxBlocksSnapshottedByNamespace = len(snapshotBlockStarts)
@@ -228,10 +228,10 @@ func (m *flushManager) snapshot(
 
 	err = snapshotPersist.DoneSnapshot(snapshotID, rotatedCommitlogID)
 	if err != nil {
-		return err
+		multiErr = multiErr.Add(err)
 	}
 
-	return nil
+	return multiErr.FinalError()
 }
 
 func (m *flushManager) Report() {
