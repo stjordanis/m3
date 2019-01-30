@@ -40,9 +40,10 @@ func NextFile(opts Options) (string, int, error) {
 	}
 
 	newIndex := 0
-	if len(files) > 0 {
-		lastFile := files[len(files)-1]
-		newIndex = int(lastFile.Index + 1)
+	for _, f := range files {
+		if int(f.Index) >= newIndex {
+			newIndex = int(f.Index + 1)
+		}
 	}
 
 	for ; ; newIndex++ {
