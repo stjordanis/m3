@@ -84,7 +84,7 @@ func TestCleanupManagerCleanupCommitlogsAndSnapshots(t *testing.T) {
 
 	testCases := []struct {
 		title                string
-		snapshotMetadata     sortedSnapshotMetadataFilesFn
+		snapshotMetadata     snapshotMetadataFilesFn
 		commitlogs           commitLogFilesFn
 		snapshots            snapshotFilesFn
 		expectedDeletedFiles []string
@@ -286,7 +286,7 @@ func TestCleanupManagerCleanupCommitlogsAndSnapshots(t *testing.T) {
 				mgr.opts.CommitLogOptions().
 					SetBlockSize(rOpts.BlockSize()))
 
-			mgr.sortedSnapshotMetadataFilesFn = tc.snapshotMetadata
+			mgr.snapshotMetadataFilesFn = tc.snapshotMetadata
 			mgr.commitLogFilesFn = tc.commitlogs
 			mgr.snapshotFilesFn = tc.snapshots
 

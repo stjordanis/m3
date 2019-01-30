@@ -22,6 +22,7 @@ package storage
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -39,7 +40,7 @@ import (
 )
 
 type commitLogFilesFn func(commitlog.Options) (persist.CommitlogFiles, []commitlog.ErrorWithPath, error)
-type sortedSnapshotMetadataFilesFn func(fs.Options) ([]fs.SnapshotMetadata, []fs.SnapshotMetadataErrorWithPaths, error)
+type snapshotMetadataFilesFn func(fs.Options) ([]fs.SnapshotMetadata, []fs.SnapshotMetadataErrorWithPaths, error)
 
 type snapshotFilesFn func(filePathPrefix string, namespace ident.ID, shard uint32) (fs.FileSetFilesSlice, error)
 
@@ -59,13 +60,13 @@ type cleanupManager struct {
 	database         database
 	activeCommitlogs activeCommitlogs
 
-	opts                          Options
-	nowFn                         clock.NowFn
-	filePathPrefix                string
-	commitLogsDir                 string
-	commitLogFilesFn              commitLogFilesFn
-	sortedSnapshotMetadataFilesFn sortedSnapshotMetadataFilesFn
-	snapshotFilesFn               snapshotFilesFn
+	opts                    Options
+	nowFn                   clock.NowFn
+	filePathPrefix          string
+	commitLogsDir           string
+	commitLogFilesFn        commitLogFilesFn
+	snapshotMetadataFilesFn snapshotMetadataFilesFn
+	snapshotFilesFn         snapshotFilesFn
 
 	deleteFilesFn               deleteFilesFn
 	deleteInactiveDirectoriesFn deleteInactiveDirectoriesFn
@@ -108,16 +109,16 @@ func newCleanupManager(
 		database:         database,
 		activeCommitlogs: activeLogs,
 
-		opts:                          opts,
-		nowFn:                         opts.ClockOptions().NowFn(),
-		filePathPrefix:                filePathPrefix,
-		commitLogsDir:                 commitLogsDir,
-		commitLogFilesFn:              commitlog.Files,
-		sortedSnapshotMetadataFilesFn: fs.SortedSnapshotMetadataFiles,
-		snapshotFilesFn:               fs.SnapshotFiles,
-		deleteFilesFn:                 fs.DeleteFiles,
-		deleteInactiveDirectoriesFn:   fs.DeleteInactiveDirectories,
-		metrics:                       newCleanupManagerMetrics(scope),
+		opts:                        opts,
+		nowFn:                       opts.ClockOptions().NowFn(),
+		filePathPrefix:              filePathPrefix,
+		commitLogsDir:               commitLogsDir,
+		commitLogFilesFn:            commitlog.Files,
+		snapshotMetadataFilesFn:     fs.SortedSnapshotMetadataFiles,
+		snapshotFilesFn:             fs.SnapshotFiles,
+		deleteFilesFn:               fs.DeleteFiles,
+		deleteInactiveDirectoriesFn: fs.DeleteInactiveDirectories,
+		metrics:                     newCleanupManagerMetrics(scope),
 	}
 }
 
@@ -309,20 +310,30 @@ func (m *cleanupManager) cleanupSnapshotsAndCommitlogs() (finalErr error) {
 	}
 
 	fsOpts := m.opts.CommitLogOptions().FilesystemOptions()
-	sortedSnapshotMetadatas, snapshotMetadataErrorsWithPaths, err := m.sortedSnapshotMetadataFilesFn(fsOpts)
+	snapshotMetadatas, snapshotMetadataErrorsWithPaths, err := m.snapshotMetadataFilesFn(fsOpts)
 	if err != nil {
 		return err
 	}
 
-	// Assert that the snapshot metadata files are indeed sorted.
+	if len(snapshotMetadatas) == 0 {
+		// No cleanup can be performed until we have at least one complete snapshot.
+		return nil
+	}
+
+	// They should technically already be sorted, but better to be safe.
+	sort.Slice(snapshotMetadatas, func(i, j int) bool {
+		return snapshotMetadatas[i].ID.Index < snapshotMetadatas[j].ID.Index
+	})
+	sortedSnapshotMetadatas := snapshotMetadatas
+
+	// Sanity check.
 	lastMetadataIndex := int64(-1)
 	for _, snapshotMetadata := range sortedSnapshotMetadatas {
 		currIndex := snapshotMetadata.ID.Index
-		if !(currIndex > lastMetadataIndex) {
+		if currIndex == lastMetadataIndex {
 			// Should never happen.
 			return fmt.Errorf(
-				"snapshot metadata files are not sorted, previous index: %d, current index: %d",
-				lastMetadataIndex, currIndex)
+				"found two snapshot metadata files with duplicate index: %d", currIndex)
 		}
 		lastMetadataIndex = currIndex
 	}
