@@ -50,10 +50,6 @@ type lazyNode struct {
 	sink       *sinkNode
 }
 
-func (f *lazyNode) Params() parser.Params {
-	return f.fNode.Params()
-}
-
 // NewLazyNode creates a new wrapper around a function fNode to make it support lazy initialization
 func NewLazyNode(node OpNode, controller *Controller) (OpNode, *Controller) {
 	c := &Controller{ID: controller.ID}

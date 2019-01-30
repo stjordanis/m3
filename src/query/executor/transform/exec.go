@@ -24,12 +24,11 @@ import (
 	"github.com/m3db/m3/src/query/block"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/parser"
-
-	"github.com/opentracing/opentracing-go"
+	"github.com/m3db/m3/src/query/util/opentracing"
 )
 
 type simpleOpNode interface {
-	OpNode
+	Params() parser.Params
 	ProcessBlock(queryCtx *models.QueryContext, ID parser.NodeID, b block.Block) (block.Block, error)
 }
 
@@ -42,8 +41,8 @@ type simpleOpNode interface {
 //     return transform.ProcessSimpleBlock(n, n.controller, queryCtx, ID, b)
 // }
 func ProcessSimpleBlock(node simpleOpNode, controller *Controller, queryCtx *models.QueryContext, ID parser.NodeID, b block.Block) error {
-	sp, _ := opentracing.StartSpanFromContext(queryCtx.Ctx, node.Params().OpType())
-	nextBlock, err := node.ProcessBlock(queryCtx, ID, b)
+	sp, ctx := opentracingutil.StartSpanFromContext(queryCtx.Ctx, node.Params().OpType())
+	nextBlock, err := node.ProcessBlock(queryCtx.WithContext(ctx), ID, b)
 	sp.Finish()
 	if err != nil {
 		return err

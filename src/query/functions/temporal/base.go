@@ -33,8 +33,8 @@ import (
 	"github.com/m3db/m3/src/query/parser"
 	"github.com/m3db/m3/src/query/ts"
 	"github.com/m3db/m3/src/query/util/logging"
+	"github.com/m3db/m3/src/query/util/opentracing"
 
-	"github.com/opentracing/opentracing-go"
 	"go.uber.org/zap"
 )
 
@@ -209,7 +209,8 @@ func (c *baseNode) Process(queryCtx *models.QueryContext, ID parser.NodeID, b bl
 		return err
 	}
 
-	return c.propagateNextBlocks(processRequests, blocks, maxBlocks)
+	return fmt.Errorf("Asdf")
+	// return c.propagateNextBlocks(processRequests, blocks, maxBlocks)
 }
 
 func closeBlocks(blocks []block.Block) {
@@ -262,7 +263,7 @@ func (c *baseNode) propagateNextBlocks(processRequests []processRequest, blocks 
 
 // processCompletedBlocks processes all blocks for which all dependent blocks are present
 func (c *baseNode) processCompletedBlocks(queryCtx *models.QueryContext, processRequests []processRequest, maxBlocks int) ([]block.Block, error) {
-	sp, _ := opentracing.StartSpanFromContext(queryCtx.Ctx, c.op.OpType())
+	sp, _ := opentracingutil.StartSpanFromContext(queryCtx.Ctx, c.op.OpType())
 	defer sp.Finish()
 
 	blocks := make([]block.Block, len(processRequests))

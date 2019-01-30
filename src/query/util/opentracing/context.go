@@ -18,8 +18,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-// Package opentracing provides more utilities for dealing with opentracing and context.Context's.
-package opentracing
+// Package opentracingutil provides more utilities for dealing with opentracing and context.Context's.
+package opentracingutil
 
 import (
 	"context"
@@ -29,6 +29,9 @@ import (
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/log"
 )
+
+// alias GlobalTracer() so we can mock out the tracer without impacting test's outside the package
+var getGlobalTracer = opentracing.GlobalTracer
 
 // SpanFromContextOrRoot is the same as opentracing.SpanFromContext, but instead of returning nil, it starts a
 // a new root span if ctx doesn't already have an associated span, instead of returning nil. Use this over
@@ -41,6 +44,23 @@ func SpanFromContextOrRoot(ctx context.Context) opentracing.Span {
 		return sp
 	}
 	return opentracing.StartSpan("SpanFromContextOrRoot - dummy")
+}
+
+// StartSpanFromContext is the same as opentracing.StartSpanFromContext, but instead of always using the global tracer,
+// it attempts to use the parent span's tracer if it's available. This behavior is (arguably) more flexible--it allows
+// a locally set tracer to be used when needed (as in tests)--while being equivalent to the original in most contexts.
+// See https://github.com/opentracing/opentracing-go/issues/149 for more discussion.
+func StartSpanFromContext(ctx context.Context, operationName string, opts ...opentracing.StartSpanOption) (opentracing.Span, context.Context) {
+	var span opentracing.Span
+	if parentSpan := opentracing.SpanFromContext(ctx); parentSpan != nil {
+		opts = append(opts, opentracing.ChildOf(parentSpan.Context()))
+		tracer := parentSpan.Tracer()
+		span = tracer.StartSpan(operationName, opts...)
+	} else {
+		tracer := getGlobalTracer()
+		span = tracer.StartSpan(operationName, opts...)
+	}
+	return span, opentracing.ContextWithSpan(ctx, span)
 }
 
 // Time is a log.Field for time.Time values. It translates to RF3339 formatted time strings.

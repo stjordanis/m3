@@ -20,14 +20,124 @@
 
 package transform
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/golang/mock/gomock"
+	"github.com/m3db/m3/src/query/block"
+	"github.com/m3db/m3/src/query/functions/utils"
+	"github.com/m3db/m3/src/query/models"
+	"github.com/m3db/m3/src/query/parser"
+	"github.com/m3db/m3/src/query/test"
+	"github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go/mocktracer"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type testSimpleNode struct {
+}
+
+func (testSimpleNode) Params() parser.Params {
+	panic("implement me")
+}
+
+func (testSimpleNode) ProcessBlock(queryCtx *models.QueryContext, ID parser.NodeID, b block.Block) (block.Block, error) {
+	panic("implement me")
+}
 
 func TestProcessSimpleBlock(t *testing.T) {
-	t.Run("closes next block", func(t *testing.T) {
 
+	type testContext struct {
+		MockCtrl    *gomock.Controller
+		Controller  *Controller
+		ChildNode   *MockOpNode
+		Node        *MocksimpleOpNode
+		ResultBlock *block.MockBlock
+		SourceBlock block.Block
+		QueryCtx    *models.QueryContext
+	}
+
+	setup := func(t *testing.T) (*testContext, func()) {
+		id := parser.NodeID("foo")
+
+		ctrl := gomock.NewController(t)
+
+		bl := block.NewMockBlock(ctrl)
+
+		controller := &Controller{
+			ID: id,
+		}
+
+		child := NewMockOpNode(ctrl)
+
+		controller.AddTransform(child)
+
+		node := NewMocksimpleOpNode(ctrl)
+
+		return &testContext{
+			MockCtrl:   ctrl,
+			Controller: controller,
+			SourceBlock: test.NewBlockFromValues(
+				models.Bounds{}, [][]float64{{1.0}}),
+			ResultBlock: bl,
+			Node:        node,
+			ChildNode:   child,
+			QueryCtx:    models.NoopQueryContext(),
+		}, ctrl.Finish
+	}
+
+	doCall := func(tctx *testContext) error {
+		return ProcessSimpleBlock(tctx.Node, tctx.Controller, tctx.QueryCtx, tctx.Controller.ID, tctx.SourceBlock)
+	}
+
+	configureSuccessfulNode := func(tctx *testContext) {
+		tctx.Node.EXPECT().Params().Return(utils.StaticParams("foo"))
+		tctx.Node.EXPECT().ProcessBlock(gomock.Any(), gomock.Any(), gomock.Any()).Return(tctx.ResultBlock, nil)
+		tctx.ChildNode.EXPECT().Process(gomock.Any(), gomock.Any(), gomock.Any())
+		tctx.ResultBlock.EXPECT().Close()
+	}
+
+	t.Run("closes next block", func(t *testing.T) {
+		tctx, closer := setup(t)
+		defer closer()
+
+		configureSuccessfulNode(tctx)
+
+		require.NoError(t, doCall(tctx))
 	})
 
 	t.Run("errors on process error", func(t *testing.T) {
+		tctx, closer := setup(t)
+		defer closer()
 
+		expectedErr := errors.New("test err")
+		tctx.Node.EXPECT().Params().Return(utils.StaticParams("foo"))
+		tctx.Node.EXPECT().ProcessBlock(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, expectedErr)
+
+		require.EqualError(t, doCall(tctx), expectedErr.Error())
+	})
+
+	t.Run("starts span with op type", func(t *testing.T) {
+		tctx, closer := setup(t)
+		defer closer()
+
+		configureSuccessfulNode(tctx)
+		tctx.Node.EXPECT().Params().Return(utils.StaticParams("foo"))
+
+		mtr := mocktracer.New()
+
+		sp := mtr.StartSpan("root")
+		tctx.QueryCtx.Ctx = opentracing.ContextWithSpan(context.Background(), sp)
+
+		require.NoError(t, doCall(tctx))
+		sp.Finish()
+
+		spans := mtr.FinishedSpans()
+
+		require.Len(t, spans, 2)
+		assert.Equal(t, tctx.Node.Params().OpType(), spans[0].OperationName)
 	})
 }

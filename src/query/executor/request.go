@@ -28,8 +28,8 @@ import (
 	"github.com/m3db/m3/src/query/parser"
 	"github.com/m3db/m3/src/query/plan"
 	"github.com/m3db/m3/src/query/util/logging"
+	"github.com/m3db/m3/src/query/util/opentracing"
 
-	"github.com/opentracing/opentracing-go"
 	"go.uber.org/zap"
 )
 
@@ -73,7 +73,7 @@ func newRequest(engine *Engine, params models.RequestParams) *Request {
 }
 
 func (r *Request) compile(ctx context.Context, parser parser.Parser) (parser.Nodes, parser.Edges, error) {
-	sp, ctx := opentracing.StartSpanFromContext(ctx, "compile")
+	sp, ctx := opentracingutil.StartSpanFromContext(ctx, "compile")
 	defer sp.Finish()
 	// TODO: Change DAG interface to take in a context
 	nodes, edges, err := parser.DAG()
@@ -89,7 +89,7 @@ func (r *Request) compile(ctx context.Context, parser parser.Parser) (parser.Nod
 }
 
 func (r *Request) plan(ctx context.Context, nodes parser.Nodes, edges parser.Edges) (plan.PhysicalPlan, error) {
-	sp, ctx := opentracing.StartSpanFromContext(ctx, "plan")
+	sp, ctx := opentracingutil.StartSpanFromContext(ctx, "plan")
 	defer sp.Finish()
 
 	lp, err := plan.NewLogicalPlan(nodes, edges)
@@ -114,7 +114,7 @@ func (r *Request) plan(ctx context.Context, nodes parser.Nodes, edges parser.Edg
 }
 
 func (r *Request) generateExecutionState(ctx context.Context, pp plan.PhysicalPlan) (*ExecutionState, error) {
-	sp, ctx := opentracing.StartSpanFromContext(ctx, "generateExecutionState")
+	sp, ctx := opentracingutil.StartSpanFromContext(ctx, "generateExecutionState")
 	defer sp.Finish()
 
 	state, err := GenerateExecutionState(pp, r.engine.store)
