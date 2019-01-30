@@ -99,7 +99,6 @@ db:
       queue:
           calculationType: fixed
           size: 2097152
-      blockSize: 10m
 
   fs:
       filePathPrefix: /var/lib/m3db
@@ -407,7 +406,6 @@ func TestConfiguration(t *testing.T) {
       calculationType: fixed
       size: 2097152
     queueChannel: null
-    blockSize: 10m0s
   repair:
     enabled: false
     interval: 2h0m0s
