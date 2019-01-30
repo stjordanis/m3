@@ -147,6 +147,8 @@ func Run(runOpts RunOptions) {
 		SetZapLogger(logger).
 		SetTracer(tracer)
 
+	opentracing.SetGlobalTracer(tracer)
+
 	// Close metrics scope
 	defer func() {
 		logger.Info("closing metrics scope")
