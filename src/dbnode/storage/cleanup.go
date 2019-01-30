@@ -303,6 +303,8 @@ func (m *cleanupManager) cleanupExpiredNamespaceDataFiles(earliestToRetain time.
 //     8. Delete all commitlog files whose index is lower than the index of the commitlog file referenced in the
 //        most recent snapshot metadata file (ignoring any commitlog files being actively written to.)
 //     9. Delete all corrupt commitlog files (ignoring any commitlog files being actively written to.)
+//
+// This process is also modeled formally in TLA+ in the file `SnapshotsSpec.tla`.
 func (m *cleanupManager) cleanupSnapshotsAndCommitlogs() (finalErr error) {
 	namespaces, err := m.database.GetOwnedNamespaces()
 	if err != nil {

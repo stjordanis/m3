@@ -91,7 +91,7 @@ type Manager interface {
 	StartIndexPersist() (IndexFlush, error)
 }
 
-// Preparer can generated a PreparedDataPersist object for writing data for
+// Preparer can generate a PreparedDataPersist object for writing data for
 // a given (shard, blockstart) combination.
 type Preparer interface {
 	// Prepare prepares writing data for a given (shard, blockStart) combination,
